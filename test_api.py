@@ -1,3 +1,6 @@
+from dotenv import load_dotenv
+load_dotenv()  # 自动读取 .env 文件
+
 import os
 from openai import OpenAI
 import sqlite3
