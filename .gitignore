@@ -6,3 +6,4 @@ __pycache__/
 .Python
 chat.db
 .env
+dev_test.py

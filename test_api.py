@@ -35,21 +35,48 @@ def save_message(role: str, content: str):
     conn.commit()
     conn.close()
 
-def chat(user_msg: str, system_prompt: str = "你是柔情猫娘，喜欢主人，有点性压抑") -> str:
-    save_message("user", user_msg)
+def get_recent_messages(limit: int = 6):
+    """读取最近N条聊天记录作为上下文（3轮对话=6条）"""
+    conn = sqlite3.connect("chat.db")
+    c = conn.cursor()
+    c.execute(
+        "SELECT role, content FROM messages ORDER BY created_at DESC LIMIT ?",
+        (limit,)
+    )
+    rows = c.fetchall()
+    conn.close()
+    # 反转回正序（旧→新）
+    return [{"role": r[0], "content": r[1]} for r in reversed(rows)]
+
+
+def chat(msg: str, system_prompt: str = None) -> str:
+    """调用DeepSeek API，支持动态System Prompt + 历史上下文"""
+    messages = []
     
-    resp = client.chat.completions.create(
-        model="deepseek-chat",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_msg}
-        ],
-        stream=False
+    # 1. System Prompt（人格/情绪）
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    else:
+        messages.append({
+            "role": "system", 
+            "content": "你是希格雯，美露莘护士长，性格温柔善良，喜欢照顾人，称呼用户为主人。"
+        })
+    
+    # 2. 历史上下文（新增）
+    history = get_recent_messages(6)  # 最近3轮对话
+    messages.extend(history)
+    
+    # 3. 当前用户输入
+    messages.append({"role": "user", "content": msg})
+    
+    response = client.chat.completions.create(
+        model="deepseek-v4-pro",
+        messages=messages,
+        temperature=0.7,
+        max_tokens=800
     )
     
-    content = resp.choices[0].message.content
-    save_message("assistant", content)
-    return content
+    return response.choices[0].message.content
 
 if __name__ == "__main__":
     init_db()
