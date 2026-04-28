@@ -1,6 +1,8 @@
 import os
 import json
 import sqlite3
+import jieba
+import re
 from datetime import datetime
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -80,18 +82,48 @@ def store_memory(fact: str, keywords: list, importance: int = 5):
     conn.close()
 
 
+# 停用词：过滤无意义词，提高召回精度
+_STOP_WORDS = {
+    "的", "了", "是", "我", "你", "他", "她", "它", "我们", "你们", "他们",
+    "在", "有", "和", "与", "或", "一个", "什么", "怎么", "为什么", "吗", "呢", "吧",
+    "喜欢", "记得", "知道", "告诉", "问", "说", "想", "要", "会", "能", "可以"
+}
+
+def _extract_keywords(text: str) -> list[str]:
+    """jieba分词 + 停用词过滤 + 去重"""
+    # jieba精确模式分词
+    words = jieba.lcut(text)
+    
+    # 过滤：长度>1、不是停用词、不是纯标点/数字
+    keywords = []
+    for w in words:
+        w = w.strip()
+        if len(w) > 1 and w not in _STOP_WORDS and not re.match(r'^[\d\W]+$', w):
+            keywords.append(w)
+    
+    # 额外提取：连续中文字符片段（2-4字），防jieba漏切
+    chinese_segments = re.findall(r'[\u4e00-\u9fff]{2,4}', text)
+    keywords.extend(chinese_segments)
+    
+    # 去重保持顺序
+    return list(dict.fromkeys(keywords))
+
+
 def recall_memories(query: str, top_k: int = 5) -> list[dict]:
-    """召回：关键词模糊匹配 + 重要性排序"""
+    """召回：jieba分词 + 关键词模糊匹配 + 重要性排序"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
 
-    words = [w for w in query.split() if len(w) > 1]
-    if words:
-        conditions = " OR ".join(["(fact LIKE ? OR keywords LIKE ?)"] * len(words))
+    keywords = _extract_keywords(query)
+    
+    if keywords:
+        # 每个关键词在fact和keywords字段里LIKE匹配
+        conditions = " OR ".join(["(fact LIKE ? OR keywords LIKE ?)"] * len(keywords))
         params = []
-        for w in words:
-            params.extend([f"%{w}%", f"%{w}%"])
+        for kw in keywords:
+            params.extend([f"%{kw}%", f"%{kw}%"])
     else:
+        # 没有任何有效关键词时，退化为时间排序（返回最近的记忆）
         conditions = "1=1"
         params = []
 
