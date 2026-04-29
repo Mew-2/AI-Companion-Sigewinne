@@ -3,7 +3,11 @@ from test_api import chat, save_message, init_db as init_chat_db
 from memory_service import extract_facts, store_memory
 from personality_state import PersonalityState
 
-app = FastAPI()
+from schemas import ChatRequest, ChatResponse
+from exceptions import setup_exception_handlers, LLMTimeoutException, CompanionException
+
+app = FastAPI(title="AI Companion API", version="1.0.0")
+setup_exception_handlers(app)
 
 # 初始化聊天记录表
 init_chat_db()
@@ -11,8 +15,9 @@ init_chat_db()
 # 全局人格实例（单用户场景）
 personality = PersonalityState()
 
-@app.get("/chat")
-def get_chat(msg: str):
+
+def _handle_chat(msg: str) -> dict:
+    """核心聊天逻辑，保持原有业务不变"""
     # 1. 人格驱动System Prompt（情绪+好感度）
     system_prompt = personality.build_system_prompt()
     
@@ -22,7 +27,7 @@ def get_chat(msg: str):
     # 3. 更新人格状态（分析情绪→好感度→惯性）
     personality.update(msg)
     
-    # 4. 保存完整聊天记录（原始数据，以后做对话RAG用）
+    # 4. 保存完整聊天记录
     save_message("user", msg)
     save_message("assistant", reply)
     
@@ -32,7 +37,30 @@ def get_chat(msg: str):
     for f in facts:
         store_memory(f["fact"], f.get("keywords", []), f.get("importance", 5))
     
-    return {"reply": reply}
+    return {"reply": reply, "emotion": personality.emotion, "affection": personality.affinity}
+
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat_post(request: ChatRequest):
+    """标准 POST 接口，Pydantic 入参出参"""
+    try:
+        result = _handle_chat(request.msg)
+        return ChatResponse(
+            reply=result["reply"],
+            emotion=result["emotion"],
+            affection=result["affection"]
+        )
+    except TimeoutError:
+        raise LLMTimeoutException()
+    except Exception as e:
+        raise CompanionException(str(e))
+
+
+@app.get("/chat")
+async def chat_get(msg: str):
+    """兼容旧版 GET /chat?msg=xxx"""
+    return await chat_post(ChatRequest(msg=msg))
+
 
 if __name__ == "__main__":
     import uvicorn
