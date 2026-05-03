@@ -42,7 +42,7 @@ def extract_facts(dialogue: str) -> list[dict]:
 - fact: 事实描述（简洁，一句话）
 - keywords: 3-5 个关键词（JSON 数组）
 - importance: 重要性 1-10（用户喜好/雷点给 8-10，闲聊给 3-5）
-只返回 JSON 数组，不要任何解释、不要 markdown 代码块。
+只返回 JSON 数组，不要任何解释、不要 markdown 代码块。最多返回 3 条事实，每条事实控制在 50 字以内。
 
 对话：
 {dialogue}"""
@@ -54,7 +54,7 @@ def extract_facts(dialogue: str) -> list[dict]:
             {"role": "user", "content": prompt}
         ],
         temperature=0.3,
-        max_tokens=800
+        max_tokens=1500
     )
 
     content = response.choices[0].message.content.strip()
