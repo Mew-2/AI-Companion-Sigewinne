@@ -7,3 +7,5 @@ __pycache__/
 chat.db
 .env
 dev_test.py
+logs/
+*.log

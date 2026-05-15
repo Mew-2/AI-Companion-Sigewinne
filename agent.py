@@ -2,7 +2,7 @@ import re
 from typing import Dict, Callable, List
 import logging
 
-logger = logging.getLogger(__name__)  # 模块级 logger
+logger = logging.getLogger(__name__)
 
 
 class ReActAgent:
@@ -22,25 +22,29 @@ class ReActAgent:
         system_ctx, user_ctx = self._build_context(system_prompt, user_msg)
         context = user_ctx  # 只有 user 部分会增长
 
+        logger.info(f"[请求] {user_msg}")
+
         for step in range(self.max_steps):
             llm_output = self._call_llm(system_ctx, context)
 
-            # 日志记录 LLM 原始输出（截断防刷屏）
-            logger.info(f"[Step {step}] LLM原始输出: {llm_output[:300]}")
+            # 完整原始输出进文件，控制台不显示
+            logger.debug(f"[Step {step}] LLM原始输出:\n{llm_output}")
 
             if "Final Answer:" in llm_output:
                 final_reply = llm_output.split("Final Answer:")[-1].strip()
-                logger.info(f"[Step {step}] 直接回答: {final_reply[:100]}")
+                logger.info(f"[Step {step}] 直接回答")
+                logger.debug(f"[Step {step}] 回答内容: {final_reply}")
                 return {"reply": final_reply, "thoughts": thoughts, "actions": actions}
 
             thought = self._extract_thought(llm_output)
             action_str = self._extract_action(llm_output)
 
-            logger.info(f"[Step {step}] Thought: {thought[:100]}")
-            logger.info(f"[Step {step}] Action: {action_str}")
+            # Thought/Action 详情进文件
+            logger.debug(f"[Step {step}] Thought: {thought}")
+            logger.debug(f"[Step {step}] Action: {action_str}")
 
             if not action_str:
-                logger.warning(f"[Step {step}] LLM未按格式输出Action，强制降级")
+                logger.warning(f"[Step {step}] 格式异常，强制降级")
                 return {
                     "reply": "希格雯思考得有点混乱...",
                     "thoughts": thoughts,
@@ -50,22 +54,26 @@ class ReActAgent:
             thoughts.append(thought)
             actions.append(action_str)
 
-            logger.info(f"[Step {step}] 原始Action字符串: {action_str}")
+            # 控制台只看调了什么工具
+            logger.info(f"[Step {step}] 调用工具: {action_str}")
+
             tool_name, tool_params = self._parse_action(action_str)
-            logger.info(
+            logger.debug(
                 f"[Step {step}] 解析结果: tool={tool_name}, params={tool_params}"
             )
 
-            tool_name, tool_params = self._parse_action(action_str)
             if tool_name in self.tools:
                 observation = self.tools[tool_name](**tool_params)
-                logger.info(f"[Step {step}] Observation: {observation[:100]}")
+                # 控制台只看返回长度，完整内容进文件
+                logger.info(f"[Step {step}] 工具返回: {len(observation)} 字")
+                logger.debug(f"[Step {step}] Observation:\n{observation}")
             else:
                 observation = f"错误：没有 {tool_name} 这个工具"
                 logger.error(f"[Step {step}] 工具不存在: {tool_name}")
 
             context += f"\nObservation: {observation}\n"
 
+        logger.info("[完成] 达到最大步数，强制结束")
         return {
             "reply": "希格雯查了好多资料，先总结到这里吧~",
             "thoughts": thoughts,
@@ -82,7 +90,10 @@ class ReActAgent:
         )
 
         # system 放：人设 + 工具说明 + 格式规则 + few-shot 示例（静态指令）
-        system_content = f"""{system_prompt}
+        system_content = f"""【绝对规则】无论用户问什么，你必须先输出 Thought: 和 Action: 或 Final Answer:。
+禁止直接以"主人"开头回复。只有 Final Answer: 后面才允许扮演希格雯。
+
+{system_prompt}
 
 你可以使用以下工具：
 {tools_desc}
@@ -144,7 +155,7 @@ Final Answer: 主人，北京今天18°C多云，记得带外套哦~"""
 
         tool_name = match.group(1)
         params_str = match.group(2).strip()
-        logger.info(f"_parse_action 原始参数字符串: {params_str}")
+        logger.debug(f"_parse_action 原始参数字符串: {params_str}")
 
         params = {}
         if params_str:
@@ -165,14 +176,14 @@ Final Answer: 主人，北京今天18°C多云，记得带外套哦~"""
                     params_keys = list(sig.parameters.keys())
                     if params_keys:
                         params[params_keys[0]] = val
-                        logger.info(f"_parse_action 推断参数: {params_keys[0]}={val}")
+                        logger.debug(f"_parse_action 推断参数: {params_keys[0]}={val}")
                 else:
                     params["query"] = val
 
             for key, val in pairs:
                 params[key] = val
 
-        logger.info(f"_parse_action 最终参数: {params}")
+        logger.debug(f"_parse_action 最终参数: {params}")
         return tool_name, params
 
     def _get_signature(self, func: Callable) -> str:

@@ -16,10 +16,29 @@ from tools.weather import get_weather
 from tools.search import web_search
 import logging
 
-# 配置全局日志：INFO 级别，显示时间、模块、级别、消息
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+# 根日志器
+logger = logging.getLogger()
+logger.setLevel(logging.DEBUG)  # 全局放行 DEBUG，由 Handler 各自过滤
+
+# 过滤第三方库噪音：httpx/httpcore/openai 的 DEBUG 不记录
+for noisy in ["httpcore", "httpx", "openai", "asyncio", "jieba"]:
+    logging.getLogger(noisy).setLevel(logging.WARNING)
+
+# 控制台：只显示 INFO 及以上，精简格式
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+console_handler.setFormatter(
+    logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
 )
+logger.addHandler(console_handler)
+
+# 文件：记录 DEBUG 及以上，完整内容写入 agent.log（自动追加，不覆盖）
+file_handler = logging.FileHandler("logs/agent.log", encoding="utf-8")
+file_handler.setLevel(logging.DEBUG)
+file_handler.setFormatter(
+    logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+)
+logger.addHandler(file_handler)
 
 app = FastAPI(title="AI Companion API", version="1.1.0")
 setup_exception_handlers(app)
