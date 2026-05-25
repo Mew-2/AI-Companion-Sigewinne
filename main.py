@@ -1,4 +1,12 @@
+import os
+import asyncio
+import json
 from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
+from typing import AsyncIterator
+
+from openai import AsyncOpenAI  # 新增：流式 LLM 客户端
+
 from test_api import (
     save_message,
     init_db as init_chat_db,
@@ -40,7 +48,7 @@ file_handler.setFormatter(
 )
 logger.addHandler(file_handler)
 
-app = FastAPI(title="AI Companion API", version="1.1.0")
+app = FastAPI(title="AI Companion API", version="1.2.0")
 setup_exception_handlers(app)
 
 # 初始化聊天记录表
@@ -49,8 +57,13 @@ init_chat_db()
 # 全局人格实例
 personality = PersonalityState()
 
+# 新增：异步 LLM 客户端（专供流式调用）
+async_llm_client = AsyncOpenAI(
+    api_key=os.environ.get("DEEPSEEK_API_KEY"), base_url="https://api.deepseek.com"
+)
 
-# 继承 ReActAgent，接入真实 LLM（不走 test_api.chat，避免重复记录历史）
+
+# 继承 ReActAgent，接入真实 LLM
 class CompanionAgent(ReActAgent):
     def _call_llm(self, system_content: str, user_content: str) -> str:
         try:
@@ -67,6 +80,29 @@ class CompanionAgent(ReActAgent):
         except Exception:
             return "Final Answer: 哎呀，希格雯的通讯魔法被干扰了...主人稍后再试好吗？"
 
+    async def _call_llm_stream(
+        self, system_content: str, user_content: str
+    ) -> AsyncIterator[str]:
+        """真实 DeepSeek 流式调用，yield 每个 token"""
+        try:
+            response = await async_llm_client.chat.completions.create(
+                model="deepseek-v4-pro",
+                messages=[
+                    {"role": "system", "content": system_content},
+                    {"role": "user", "content": user_content},
+                ],
+                temperature=0.7,
+                max_tokens=800,
+                stream=True,
+            )
+            async for chunk in response:
+                delta = chunk.choices[0].delta.content
+                if delta:
+                    yield delta
+        except Exception as e:
+            logger.error(f"LLM流式调用失败: {e}")
+            yield "哎呀，希格雯的通讯魔法被干扰了...主人稍后再试好吗？"
+
 
 # 初始化 Agent：注册可用工具
 agent = CompanionAgent(tools={"weather": get_weather, "search": web_search})
@@ -74,7 +110,7 @@ agent = CompanionAgent(tools={"weather": get_weather, "search": web_search})
 
 def _handle_chat(msg: str) -> dict:
     """
-    完整链路：短期历史 + 人格 + 长期记忆 → ReAct 循环 → 更新人格 → 保存对话 → 提取记忆
+    完整链路（非流式）：短期历史 + 人格 + 长期记忆 → ReAct 循环 → 更新人格 → 保存对话 → 提取记忆
     """
     # 1. 人格驱动 System Prompt
     system_prompt = personality.build_system_prompt()
@@ -120,9 +156,71 @@ def _handle_chat(msg: str) -> dict:
     }
 
 
+async def _handle_chat_stream(msg: str):
+    """
+    流式聊天：ReAct 规划（非流式，后台完成）+ LLM 真流式生成 + NDJSON 输出。
+    情绪/好感度在 meta 包中前置发送，WPF 可立即切换立绘。
+    """
+    # 1. 人格 System Prompt
+    system_prompt = personality.build_system_prompt()
+
+    # 2. 短期历史注入
+    history = get_recent_messages(6)
+    if history:
+        history_text = "\n".join([f"{h['role']}: {h['content']}" for h in history])
+        system_prompt += f"\n\n最近的对话：\n{history_text}"
+
+    # 3. 长期记忆召回
+    memories = recall_memories(msg, top_k=3)
+    if memories:
+        memory_text = "你记得关于主人的事情：\n" + "\n".join(
+            [f"- {m['fact']}" for m in memories]
+        )
+        system_prompt += f"\n\n{memory_text}"
+        for m in memories:
+            update_accessed(m["id"])
+
+    # 4. 更新人格状态（含 LLM 调用，放线程池避免阻塞事件循环）
+    await asyncio.to_thread(personality.update, msg)
+
+    # 5. 流式生成器
+    full_reply_parts = []
+
+    async def ndjson_generator():
+        async for chunk in agent.run_stream(msg, system_prompt):
+            if chunk["type"] == "meta":
+                # 注入人格状态到 meta 包
+                chunk["emotion"] = personality.emotion
+                chunk["affection"] = personality.affinity
+            elif chunk["type"] == "text":
+                full_reply_parts.append(chunk["content"])
+
+            yield json.dumps(chunk, ensure_ascii=False) + "\n"
+
+        # 6. 流结束后：持久化（放线程池）
+        reply_text = "".join(full_reply_parts)
+        await asyncio.to_thread(save_message, "user", msg)
+        await asyncio.to_thread(save_message, "assistant", reply_text)
+
+        dialogue = f"用户：{msg}\n助手：{reply_text}"
+        facts = await asyncio.to_thread(extract_facts, dialogue)
+        for f in facts:
+            await asyncio.to_thread(
+                store_memory,
+                f["fact"],
+                f.get("keywords", []),
+                f.get("importance", 5),
+            )
+
+    return StreamingResponse(
+        ndjson_generator(),
+        media_type="application/x-ndjson",
+    )
+
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat_post(request: ChatRequest):
-    """标准 POST 接口"""
+    """标准 POST 接口（非流式，兼容旧版）"""
     try:
         result = _handle_chat(request.msg)
         return ChatResponse(
@@ -140,6 +238,28 @@ async def chat_post(request: ChatRequest):
 async def chat_get(msg: str):
     """兼容旧版 GET /chat?msg=xxx"""
     return await chat_post(ChatRequest(msg=msg))
+
+
+@app.post("/chat/stream")
+async def chat_stream(request: ChatRequest):
+    """流式聊天接口：NDJSON 格式，真流式 LLM 输出"""
+    try:
+        return await _handle_chat_stream(request.msg)
+    except Exception as e:
+        logger.error(f"流式接口异常: {e}")
+
+        # 降级：返回包含错误信息的流
+        async def error_stream():
+            yield json.dumps({"type": "meta", "emotion": "sad", "affection": 0}) + "\n"
+            yield json.dumps(
+                {"type": "text", "content": "希格雯的连接断开了，请稍后再试..."}
+            ) + "\n"
+            yield json.dumps({"type": "done"}) + "\n"
+
+        return StreamingResponse(
+            error_stream(),
+            media_type="application/x-ndjson",
+        )
 
 
 if __name__ == "__main__":

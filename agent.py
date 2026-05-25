@@ -1,6 +1,7 @@
 import re
-from typing import Dict, Callable, List
+from typing import Dict, Callable, List, AsyncIterator
 import logging
+import asyncio
 
 logger = logging.getLogger(__name__)
 
@@ -8,77 +9,143 @@ logger = logging.getLogger(__name__)
 class ReActAgent:
     """
     手写 ReAct 循环：Thought -> Action -> Observation -> ... -> Final Answer
+    支持非流式(run)和流式(run_stream)两种模式。
     """
 
     def __init__(self, tools: Dict[str, callable], max_steps: int = 3):
         self.tools = tools
         self.max_steps = max_steps
 
-    def run(self, user_msg: str, system_prompt: str) -> dict:
+    def _run_react_planning(
+        self, system_ctx: str, user_ctx: str
+    ) -> tuple[str, List[str], List[str], str | None, str | None]:
+        """
+        非流式跑 ReAct 规划循环，收集工具调用和观察结果。
+        返回: (final_context, thoughts, actions, used_tool, direct_answer)
+        """
         thoughts = []
         actions = []
-
-        # 分离 system 和初始 user content
-        system_ctx, user_ctx = self._build_context(system_prompt, user_msg)
-        context = user_ctx  # 只有 user 部分会增长
-
-        logger.info(f"[请求] {user_msg}")
+        context = user_ctx
+        used_tool = None
+        direct_answer = None
 
         for step in range(self.max_steps):
             llm_output = self._call_llm(system_ctx, context)
 
-            # 完整原始输出进文件，控制台不显示
-            logger.debug(f"[Step {step}] LLM原始输出:\n{llm_output}")
-
             if "Final Answer:" in llm_output:
-                final_reply = llm_output.split("Final Answer:")[-1].strip()
-                logger.info(f"[Step {step}] 直接回答")
-                logger.debug(f"[Step {step}] 回答内容: {final_reply}")
-                return {"reply": final_reply, "thoughts": thoughts, "actions": actions}
+                direct_answer = llm_output.split("Final Answer:")[-1].strip()
+                logger.info(f"[Step {step}] 直接回答（无需工具）")
+                break
 
             thought = self._extract_thought(llm_output)
             action_str = self._extract_action(llm_output)
 
-            # Thought/Action 详情进文件
-            logger.debug(f"[Step {step}] Thought: {thought}")
-            logger.debug(f"[Step {step}] Action: {action_str}")
-
             if not action_str:
-                logger.warning(f"[Step {step}] 格式异常，强制降级")
-                return {
-                    "reply": "希格雯思考得有点混乱...",
-                    "thoughts": thoughts,
-                    "actions": actions,
-                }
+                logger.warning(f"[Step {step}] 格式异常，终止规划")
+                break
 
             thoughts.append(thought)
             actions.append(action_str)
 
-            # 控制台只看调了什么工具
-            logger.info(f"[Step {step}] 调用工具: {action_str}")
-
             tool_name, tool_params = self._parse_action(action_str)
-            logger.debug(
-                f"[Step {step}] 解析结果: tool={tool_name}, params={tool_params}"
-            )
+            logger.info(f"[Step {step}] 调用工具: {action_str}")
 
             if tool_name in self.tools:
                 observation = self.tools[tool_name](**tool_params)
-                # 控制台只看返回长度，完整内容进文件
+                if used_tool is None:
+                    used_tool = tool_name
                 logger.info(f"[Step {step}] 工具返回: {len(observation)} 字")
-                logger.debug(f"[Step {step}] Observation:\n{observation}")
             else:
                 observation = f"错误：没有 {tool_name} 这个工具"
                 logger.error(f"[Step {step}] 工具不存在: {tool_name}")
 
             context += f"\nObservation: {observation}\n"
 
-        logger.info("[完成] 达到最大步数，强制结束")
+        return context, thoughts, actions, used_tool, direct_answer
+
+    def run(self, user_msg: str, system_prompt: str) -> dict:
+        """
+        标准非流式 ReAct（兼容旧版 /chat 接口）。
+        """
+        system_ctx, user_ctx = self._build_context(system_prompt, user_msg)
+        context, thoughts, actions, used_tool, direct_answer = self._run_react_planning(
+            system_ctx, user_ctx
+        )
+
+        if direct_answer:
+            return {
+                "reply": direct_answer,
+                "thoughts": thoughts,
+                "actions": actions,
+                "used_tool": used_tool,
+            }
+
+        # 达到 max_steps 或异常，基于最终上下文生成总结
+        answer_system = (
+            system_ctx
+            + "\n\n【规则】基于以上思考和观察，请给出对用户的最终回复。"
+            + "只输出回复内容，不要带 Thought/Action/Observation 前缀。"
+        )
+        answer_user = f"用户问题：{user_msg}\n\n请直接回答："
+
+        summary = self._call_llm(answer_system, answer_user)
+        final_reply = summary.replace("Final Answer:", "").strip()
+
         return {
-            "reply": "希格雯查了好多资料，先总结到这里吧~",
+            "reply": final_reply,
             "thoughts": thoughts,
             "actions": actions,
+            "used_tool": used_tool,
         }
+
+    async def run_stream(
+        self, user_msg: str, system_prompt: str
+    ) -> AsyncIterator[dict]:
+        """
+        流式 ReAct：
+        1. 非流式完成规划（Thought/Action/Observation）
+        2. 干净 prompt 流式生成 Final Answer（真流式，非模拟）
+        """
+        system_ctx, user_ctx = self._build_context(system_prompt, user_msg)
+
+        # 阶段 1：规划放线程池，避免阻塞 FastAPI 事件循环
+        context, thoughts, actions, used_tool, direct_answer = await asyncio.to_thread(
+            self._run_react_planning, system_ctx, user_ctx
+        )
+
+        yield {"type": "meta", "used_tool": used_tool, "thoughts": thoughts}
+
+        # 阶段 2：生成最终回复
+        if direct_answer:
+            # 无需工具，LLM 规划阶段已直接给出 Final Answer，逐字流式输出
+            for char in direct_answer:
+                yield {"type": "text", "content": char}
+        else:
+            # 需要工具：system prompt 彻底隔离 ReAct 规则，只保留人设 + 强约束
+            clean_system = f"""{system_prompt}
+
+【绝对规则】你现在直接对用户说话，像希格雯一样自然聊天。
+- 禁止输出 Thought、Action、Observation、Final Answer 等任何标签或英文前缀
+- 禁止暴露查询过程（如"我查了一下天气"）
+- 直接把信息自然融入回复，语气温柔，只说中文"""
+
+            # context 里已包含完整 ReAct 历史（含 Observation 结果）
+            answer_user = f"请基于以下信息直接回复用户，不要加任何标签：\n\n{context}\n\n用户原始问题：{user_msg}\n\n希格雯说："
+
+            async for token in self._call_llm_stream(clean_system, answer_user):
+                yield {"type": "text", "content": token}
+
+        yield {"type": "done"}
+
+    def _call_llm(self, system_content: str, user_content: str) -> str:
+        """基类 mock，子类覆盖为真实 LLM 调用"""
+        return "Final Answer: 这是模拟回复，实际接入 LLM 后替换。"
+
+    async def _call_llm_stream(
+        self, system_content: str, user_content: str
+    ) -> AsyncIterator[str]:
+        """基类 mock，子类覆盖为真实 LLM 流式调用。yield 每个 token."""
+        yield "这是模拟流式回复，实际接入 LLM 后替换。"
 
     def _build_context(self, system_prompt: str, user_msg: str) -> tuple[str, str]:
         """返回 (system_content, user_content)"""
@@ -129,10 +196,6 @@ Final Answer: 主人，北京今天18°C多云，记得带外套哦~"""
         user_content = f"Question: {user_msg}\nThought:"
 
         return system_content, user_content
-
-    def _call_llm(self, system_content: str, user_content: str) -> str:
-        """基类 mock，子类覆盖"""
-        return "Final Answer: 这是模拟回复，实际接入 LLM 后替换。"
 
     def _extract_thought(self, output: str) -> str:
         """从 LLM 输出提取 Thought"""
