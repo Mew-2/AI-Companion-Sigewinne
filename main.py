@@ -180,42 +180,34 @@ async def _handle_chat_stream(msg: str):
         for m in memories:
             update_accessed(m["id"])
 
-    # 4. 更新人格状态（含 LLM 调用，放线程池避免阻塞事件循环）
-    await asyncio.to_thread(personality.update, msg)
-
     # 5. 流式生成器
     full_reply_parts = []
 
     async def ndjson_generator():
         async for chunk in agent.run_stream(msg, system_prompt):
             if chunk["type"] == "meta":
-                # 注入人格状态到 meta 包
+                # 用旧状态（上一条消息后的值），流结束后再更新
                 chunk["emotion"] = personality.emotion
                 chunk["affection"] = personality.affinity
             elif chunk["type"] == "text":
                 full_reply_parts.append(chunk["content"])
-
             yield json.dumps(chunk, ensure_ascii=False) + "\n"
 
-        # 6. 流结束后：持久化（放线程池）
+        # 流结束后：持久化 + 更新人格（与 /chat 非流式顺序一致）
         reply_text = "".join(full_reply_parts)
         await asyncio.to_thread(save_message, "user", msg)
         await asyncio.to_thread(save_message, "assistant", reply_text)
-
         dialogue = f"用户：{msg}\n助手：{reply_text}"
         facts = await asyncio.to_thread(extract_facts, dialogue)
         for f in facts:
             await asyncio.to_thread(
-                store_memory,
-                f["fact"],
-                f.get("keywords", []),
-                f.get("importance", 5),
+                store_memory, f["fact"], f.get("keywords", []), f.get("importance", 5)
             )
 
-    return StreamingResponse(
-        ndjson_generator(),
-        media_type="application/x-ndjson",
-    )
+        # 最后更新人格
+        await asyncio.to_thread(personality.update, msg)
+
+    return StreamingResponse(ndjson_generator(), media_type="application/x-ndjson")
 
 
 @app.post("/chat", response_model=ChatResponse)
