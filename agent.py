@@ -42,6 +42,7 @@ class ReActAgent:
 
             if not action_str:
                 logger.warning(f"[Step {step}] 格式异常，终止规划")
+                logger.warning(f"[Step {step}] LLM原始输出:\n{llm_output}")
                 break
 
             thoughts.append(thought)
@@ -114,6 +115,10 @@ class ReActAgent:
         )
 
         yield {"type": "meta", "used_tool": used_tool, "thoughts": thoughts}
+
+        logger.info(
+            f"[ReAct] Thoughts: {thoughts}, Actions: {actions}, Tool: {used_tool}"
+        )
 
         # 阶段 2：生成最终回复
         if direct_answer:

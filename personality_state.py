@@ -1,9 +1,13 @@
 import sqlite3
+import logging
+
+logger = logging.getLogger(__name__)
 import json
 from datetime import datetime
 from memory_service import client  # 复用已有的DeepSeek客户端
 
 DB_PATH = "chat.db"
+
 
 def init_personality_db():
     """建 personality 表，只存一行（当前状态）"""
@@ -24,12 +28,13 @@ def init_personality_db():
     conn.commit()
     conn.close()
 
+
 class PersonalityState:
     def __init__(self):
         init_personality_db()
         # 从SQLite加载状态到self
         self.affinity, self.emotion, self.momentum, self.positive_count = self._load()
-    
+
     def _load(self):
         """从数据库加载状态"""
         conn = sqlite3.connect(DB_PATH)
@@ -43,16 +48,25 @@ class PersonalityState:
         if row:
             return row[0], row[1], row[2], row[3]
         return 0, "normal", 0, 0
-    
+
     def _save(self):
         """把self当前状态写回SQLite"""
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
-        c.execute("""
+        c.execute(
+            """
                   UPDATE personality
                   SET affinity=?,emotion=?,emotion_momentum=?,consecutive_positive=?,updated_at=?
                   WHERE id=1
-                  """,(self.affinity,self.emotion,self.momentum,self.positive_count,datetime.now()))
+                  """,
+            (
+                self.affinity,
+                self.emotion,
+                self.momentum,
+                self.positive_count,
+                datetime.now(),
+            ),
+        )
         conn.commit()
         conn.close()
 
@@ -68,21 +82,26 @@ class PersonalityState:
             model="deepseek-v4-pro",
             messages=[
                 {"role": "system", "content": "你是情绪分析助手，只输出JSON。"},
-                {"role": "user", "content": prompt}
+                {"role": "user", "content": prompt},
             ],
             temperature=0.3,
-            max_tokens=100
+            max_tokens=100,
         )
 
         content = response.choices[0].message.content.strip()
-        content = content.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+        content = (
+            content.removeprefix("```json")
+            .removeprefix("```")
+            .removesuffix("```")
+            .strip()
+        )
 
         try:
             data = json.loads(content)
             return float(data.get("sentiment", 0))
         except (json.JSONDecodeError, ValueError):
             return 0.0
-    
+
     def build_system_prompt(self) -> str:
         """根据当前情绪拼System Prompt"""
         lines = [
@@ -99,7 +118,7 @@ class PersonalityState:
             lines.append("语气温柔，像平常一样陪伴主人。")
 
         return "\n".join(lines)
-    
+
     def update(self, user_msg: str):
         """核心：分析情绪→更新好感度→确定情绪→存库"""
         sentiment = self._analyze_sentiment(user_msg)
@@ -129,6 +148,10 @@ class PersonalityState:
             self.momentum = max(0, self.momentum - 1)
             if self.momentum == 0 and self.emotion in ("angry", "sad"):
                 self.emotion = "normal"
+
+        logger.info(
+            f"[人格] 情绪: {self.emotion}, 好感度: {self.affinity}, 动量: {self.momentum}"
+        )
 
         # 3. 持久化
         self._save()

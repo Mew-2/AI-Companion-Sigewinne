@@ -161,6 +161,8 @@ async def _handle_chat_stream(msg: str):
     流式聊天：ReAct 规划（非流式，后台完成）+ LLM 真流式生成 + NDJSON 输出。
     情绪/好感度在 meta 包中前置发送，WPF 可立即切换立绘。
     """
+    logger.info(f"[聊天] 用户: {msg}")
+
     # 1. 人格 System Prompt
     system_prompt = personality.build_system_prompt()
 
@@ -195,6 +197,7 @@ async def _handle_chat_stream(msg: str):
 
         # 流结束后：持久化 + 更新人格（与 /chat 非流式顺序一致）
         reply_text = "".join(full_reply_parts)
+        logger.info(f"[聊天] 助手: {reply_text}")
         await asyncio.to_thread(save_message, "user", msg)
         await asyncio.to_thread(save_message, "assistant", reply_text)
         dialogue = f"用户：{msg}\n助手：{reply_text}"
