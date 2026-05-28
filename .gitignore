@@ -9,3 +9,4 @@ chat.db
 dev_test.py
 logs/
 *.log
+chroma_db/

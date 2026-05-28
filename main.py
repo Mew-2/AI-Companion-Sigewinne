@@ -57,6 +57,11 @@ init_chat_db()
 # 全局人格实例
 personality = PersonalityState()
 
+from retrievers.anime_kb import AnimeRAG
+
+# 全局初始化RAG
+anime_rag = AnimeRAG()
+
 # 新增：异步 LLM 客户端（专供流式调用）
 async_llm_client = AsyncOpenAI(
     api_key=os.environ.get("DEEPSEEK_API_KEY"), base_url="https://api.deepseek.com"
@@ -132,18 +137,34 @@ def _handle_chat(msg: str) -> dict:
         for m in memories:
             update_accessed(m["id"])
 
-    # 4. Agent ReAct 循环
+    # 4. 二次元 RAG 知识库召回（混合检索：语义召回 + tag 命中补充）
+    # 基线：纯语义召回（保证广度）
+    rag_docs = anime_rag.retrieve(msg, top_k=3)
+
+    # 补充：用户消息命中知识库 tag 时，追加精准过滤召回（提升关系/实体类问题命中率）
+    hit_tags = [t for t in anime_rag.get_all_tags() if t in msg]
+    extra_docs = []
+    for t in hit_tags:
+        extra_docs.extend(anime_rag.retrieve(msg, top_k=2, tag=t))
+
+    # 合并去重，保留顺序
+    all_docs = list(dict.fromkeys(rag_docs + extra_docs))
+    if all_docs:
+        rag_text = "【角色设定资料】\n" + "\n".join([f"- {d}" for d in all_docs])
+        system_prompt += f"\n\n{rag_text}"
+
+    # 5. Agent ReAct 循环
     result = agent.run(msg, system_prompt)
     reply = result["reply"]
 
-    # 5. 更新人格状态
+    # 6. 更新人格状态
     personality.update(msg)
 
-    # 6. 保存完整聊天记录
+    # 7. 保存完整聊天记录
     save_message("user", msg)
     save_message("assistant", reply)
 
-    # 7. 提取结构化记忆
+    # 8. 提取结构化记忆
     dialogue = f"用户：{msg}\n助手：{reply}"
     facts = extract_facts(dialogue)
     for f in facts:
@@ -181,6 +202,22 @@ async def _handle_chat_stream(msg: str):
         system_prompt += f"\n\n{memory_text}"
         for m in memories:
             update_accessed(m["id"])
+
+    # 4. 二次元 RAG 知识库召回（混合检索：语义召回 + tag 命中补充）
+    # 基线：纯语义召回（保证广度）
+    rag_docs = anime_rag.retrieve(msg, top_k=3)
+
+    # 补充：用户消息命中知识库 tag 时，追加精准过滤召回（提升关系/实体类问题命中率）
+    hit_tags = [t for t in anime_rag.get_all_tags() if t in msg]
+    extra_docs = []
+    for t in hit_tags:
+        extra_docs.extend(anime_rag.retrieve(msg, top_k=2, tag=t))
+
+    # 合并去重，保留顺序
+    all_docs = list(dict.fromkeys(rag_docs + extra_docs))
+    if all_docs:
+        rag_text = "【角色设定资料】\n" + "\n".join([f"- {d}" for d in all_docs])
+        system_prompt += f"\n\n{rag_text}"
 
     # 5. 流式生成器
     full_reply_parts = []
