@@ -41,6 +41,7 @@ console_handler.setFormatter(
 logger.addHandler(console_handler)
 
 # 文件：记录 DEBUG 及以上，完整内容写入 agent.log（自动追加，不覆盖）
+os.makedirs("logs", exist_ok=True)
 file_handler = logging.FileHandler("logs/agent.log", encoding="utf-8")
 file_handler.setLevel(logging.DEBUG)
 file_handler.setFormatter(
@@ -113,6 +114,38 @@ class CompanionAgent(ReActAgent):
 agent = CompanionAgent(tools={"weather": get_weather, "search": web_search})
 
 
+def _build_rag_context(msg: str) -> str:
+    """召回角色设定资料，并记录 RAG 是否命中。"""
+    logger.info(f"[RAG] 开始召回: {msg}")
+
+    # 基线：纯语义召回（保证广度）
+    rag_docs = anime_rag.retrieve(msg, top_k=3)
+
+    # 补充：用户消息命中知识库 tag 时，追加精准过滤召回（提升关系/实体类问题命中率）
+    hit_tags = [t for t in anime_rag.get_all_tags() if t in msg]
+    extra_docs = []
+    for t in hit_tags:
+        extra_docs.extend(anime_rag.retrieve(msg, top_k=2, tag=t))
+
+    # 合并去重，保留顺序
+    all_docs = list(dict.fromkeys(rag_docs + extra_docs))
+    logger.info(
+        f"[RAG] 语义命中 {len(rag_docs)} 条, tag命中 {hit_tags or '无'}, "
+        f"tag补充 {len(extra_docs)} 条, 最终注入 {len(all_docs)} 条"
+    )
+
+    if not all_docs:
+        logger.info("[RAG] 未注入角色设定资料")
+        return ""
+
+    for i, doc in enumerate(all_docs, 1):
+        preview = doc.replace("\n", " ")[:120]
+        logger.info(f"[RAG] 注入片段{i}: {preview}")
+        logger.debug(f"[RAG] 注入片段{i}全文: {doc}")
+
+    return "【角色设定资料】\n" + "\n".join([f"- {d}" for d in all_docs])
+
+
 def _handle_chat(msg: str) -> dict:
     """
     完整链路（非流式）：短期历史 + 人格 + 长期记忆 → ReAct 循环 → 更新人格 → 保存对话 → 提取记忆
@@ -138,19 +171,8 @@ def _handle_chat(msg: str) -> dict:
             update_accessed(m["id"])
 
     # 4. 二次元 RAG 知识库召回（混合检索：语义召回 + tag 命中补充）
-    # 基线：纯语义召回（保证广度）
-    rag_docs = anime_rag.retrieve(msg, top_k=3)
-
-    # 补充：用户消息命中知识库 tag 时，追加精准过滤召回（提升关系/实体类问题命中率）
-    hit_tags = [t for t in anime_rag.get_all_tags() if t in msg]
-    extra_docs = []
-    for t in hit_tags:
-        extra_docs.extend(anime_rag.retrieve(msg, top_k=2, tag=t))
-
-    # 合并去重，保留顺序
-    all_docs = list(dict.fromkeys(rag_docs + extra_docs))
-    if all_docs:
-        rag_text = "【角色设定资料】\n" + "\n".join([f"- {d}" for d in all_docs])
+    rag_text = _build_rag_context(msg)
+    if rag_text:
         system_prompt += f"\n\n{rag_text}"
 
     # 5. Agent ReAct 循环
@@ -204,19 +226,8 @@ async def _handle_chat_stream(msg: str):
             update_accessed(m["id"])
 
     # 4. 二次元 RAG 知识库召回（混合检索：语义召回 + tag 命中补充）
-    # 基线：纯语义召回（保证广度）
-    rag_docs = anime_rag.retrieve(msg, top_k=3)
-
-    # 补充：用户消息命中知识库 tag 时，追加精准过滤召回（提升关系/实体类问题命中率）
-    hit_tags = [t for t in anime_rag.get_all_tags() if t in msg]
-    extra_docs = []
-    for t in hit_tags:
-        extra_docs.extend(anime_rag.retrieve(msg, top_k=2, tag=t))
-
-    # 合并去重，保留顺序
-    all_docs = list(dict.fromkeys(rag_docs + extra_docs))
-    if all_docs:
-        rag_text = "【角色设定资料】\n" + "\n".join([f"- {d}" for d in all_docs])
+    rag_text = _build_rag_context(msg)
+    if rag_text:
         system_prompt += f"\n\n{rag_text}"
 
     # 5. 流式生成器
