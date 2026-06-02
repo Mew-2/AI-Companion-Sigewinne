@@ -1,7 +1,7 @@
 import os
 import asyncio
 import json
-from fastapi import FastAPI
+from fastapi import FastAPI, BackgroundTasks
 from fastapi.responses import StreamingResponse
 from typing import AsyncIterator
 
@@ -199,7 +199,25 @@ def _handle_chat(msg: str) -> dict:
     }
 
 
-async def _handle_chat_stream(msg: str):
+async def _persist_chat(msg: str, parts: list):
+
+    # 持久化
+    reply_text = "".join(parts)
+    logger.info(f"[聊天] 助手: {reply_text}")
+    await asyncio.to_thread(save_message, "user", msg)
+    await asyncio.to_thread(save_message, "assistant", reply_text)
+    dialogue = f"用户：{msg}\n助手：{reply_text}"
+    facts = await asyncio.to_thread(extract_facts, dialogue)
+    for f in facts:
+        await asyncio.to_thread(
+            store_memory, f["fact"], f.get("keywords", []), f.get("importance", 5)
+        )
+
+    # 更新人格
+    await asyncio.to_thread(personality.update, msg)
+
+
+async def _handle_chat_stream(msg: str, background_tasks: BackgroundTasks):
     """
     流式聊天：ReAct 规划（非流式，后台完成）+ LLM 真流式生成 + NDJSON 输出。
     情绪/好感度在 meta 包中前置发送，WPF 可立即切换立绘。
@@ -243,20 +261,8 @@ async def _handle_chat_stream(msg: str):
                 full_reply_parts.append(chunk["content"])
             yield json.dumps(chunk, ensure_ascii=False) + "\n"
 
-        # 流结束后：持久化 + 更新人格（与 /chat 非流式顺序一致）
-        reply_text = "".join(full_reply_parts)
-        logger.info(f"[聊天] 助手: {reply_text}")
-        await asyncio.to_thread(save_message, "user", msg)
-        await asyncio.to_thread(save_message, "assistant", reply_text)
-        dialogue = f"用户：{msg}\n助手：{reply_text}"
-        facts = await asyncio.to_thread(extract_facts, dialogue)
-        for f in facts:
-            await asyncio.to_thread(
-                store_memory, f["fact"], f.get("keywords", []), f.get("importance", 5)
-            )
-
-        # 最后更新人格
-        await asyncio.to_thread(personality.update, msg)
+    # 6. 后处理：持久化聊天记录、提取记忆、更新人格
+    background_tasks.add_task(_persist_chat, msg, full_reply_parts)
 
     return StreamingResponse(ndjson_generator(), media_type="application/x-ndjson")
 
@@ -284,10 +290,10 @@ async def chat_get(msg: str):
 
 
 @app.post("/chat/stream")
-async def chat_stream(request: ChatRequest):
+async def chat_stream(request: ChatRequest, background_tasks: BackgroundTasks):
     """流式聊天接口：NDJSON 格式，真流式 LLM 输出"""
     try:
-        return await _handle_chat_stream(request.msg)
+        return await _handle_chat_stream(request.msg, background_tasks)
     except Exception as e:
         logger.error(f"流式接口异常: {e}")
 

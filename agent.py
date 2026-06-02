@@ -81,13 +81,12 @@ class ReActAgent:
                 "used_tool": used_tool,
             }
 
-        # 达到 max_steps 或异常，基于最终上下文生成总结
-        answer_system = (
-            system_ctx
-            + "\n\n【规则】基于以上思考和观察，请给出对用户的最终回复。"
-            + "只输出回复内容，不要带 Thought/Action/Observation 前缀。"
-        )
-        answer_user = f"用户问题：{user_msg}\n\n请直接回答："
+        # 达到 max_steps 或异常：用人设 + 工具结果生成最终回复
+        answer_system = f"""{system_prompt}
+
+【规则】基于以上工具调用得到的信息，以希格雯的身份直接回复用户。
+只输出回复内容，不要带 Thought/Action/Observation 前缀。"""
+        answer_user = f"用户问题：{user_msg}\n\n工具调用过程：\n{context}\n\n希格雯说："
 
         summary = self._call_llm(answer_system, answer_user)
         final_reply = summary.replace("Final Answer:", "").strip()
@@ -161,42 +160,54 @@ class ReActAgent:
             ]
         )
 
-        # system 放：人设 + 工具说明 + 格式规则 + few-shot 示例（静态指令）
-        system_content = f"""【绝对规则】无论用户问什么，你必须先输出 Thought: 和 Action: 或 Final Answer:。
-禁止直接以"主人"开头回复。只有 Final Answer: 后面才允许扮演希格雯。
-
-{system_prompt}
+        # 只留极简身份标识 + 工具规则，不渗入完整人设/RAG/历史，避免角色扮演干扰工具决策
+        system_content = f"""你是希格雯，同时也需要判断用户是否需要调用实时工具来获取信息。
 
 你可以使用以下工具：
 {tools_desc}
 
-请按以下格式思考并行动：
-Thought: 你的思考过程（分析用户需要什么信息）
-Action: 工具名称(参数)
-Observation: 工具返回结果（由系统自动填入）
+【硬规则——必须调用工具】
+- 用户询问天气、气温、温度、空气质量、湿度、风向等实时/时效性信息 → 必须调用 weather 或 search
+- 用户询问实时新闻、热搜、股价、比赛结果等 → 必须调用 search
+- 用户说"看下/查一下/看一下/搜一下/搜索/查查/查一查" + 天气/城市/新闻等 → 必须调用对应工具
+- 即使你了解一些背景常识，对于实时数据也不能绕过工具
 
-当不需要再调用工具时，直接输出：
-Final Answer: 给用户的最终回复
+【格式】
+Thought: 分析是否需要工具
+Action: 工具名称(参数)
+
+当不需要工具时，直接输出：
+Final Answer: 回复内容
 
 注意：
 - 每次只能调用一个工具
-- 如果用户问题不需要工具，直接 Final Answer
-- 如果工具调用失败，说明原因并继续
-- Action 的参数必须用英文单引号包裹，如 weather(city='上海')
-- **当你看到 Observation 后，请总结信息并输出 Final Answer**
+- Action 参数必须用英文单引号包裹，如 weather(city='上海')
 
-示例1（不需要工具）：
+示例：
+
+Question: 北京今天天气怎么样？
+Thought: 用户问天气，需要调用天气工具
+Action: weather(city='北京')
+
+Question: 查一下上海今天天气
+Thought: 用户想查天气，需要调用天气工具
+Action: weather(city='上海')
+
+Question: 看下上海天气
+Thought: 用户想看天气，需要调用天气工具
+Action: weather(city='上海')
+
+Question: 搜一下今天的新闻
+Thought: 用户想搜索新闻，需要调用搜索工具
+Action: search(query='今天新闻')
+
+Question: 你头发是什么颜色的？
+Thought: 用户问的是角色设定常识，不需要工具
+Final Answer: 主人，我的头发是蓝色的哦~
+
 Question: 你好
 Thought: 用户打招呼，不需要工具
-Final Answer: 你好呀主人~
-
-示例2（需要工具，两轮循环）：
-Question: 北京今天天气怎么样？
-Thought: 用户问天气，我需要查天气工具
-Action: weather(city='北京')
-Observation: 北京今天18°C，多云
-Thought: 我已经获得天气信息，可以直接回答用户了
-Final Answer: 主人，北京今天18°C多云，记得带外套哦~"""
+Final Answer: 主人好呀~"""
 
         user_content = f"Question: {user_msg}\nThought:"
 
