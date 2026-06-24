@@ -2,12 +2,19 @@ import os
 import json
 import sqlite3
 import jieba
+from retrievers.user_memory import UserMemoryRAG
 import re
 from datetime import datetime
 from openai import OpenAI
 from dotenv import load_dotenv
+import logging
+
+logger = logging.getLogger(__name__)
 
 load_dotenv()
+
+# 全局初始化向量记忆
+user_memory_rag = UserMemoryRAG()
 
 client = OpenAI(
     api_key=os.getenv("DEEPSEEK_API_KEY"), base_url="https://api.deepseek.com"
@@ -72,7 +79,7 @@ def extract_facts(dialogue: str) -> list[dict]:
 
 
 def store_memory(fact: str, keywords: list, importance: int = 5):
-    """存记忆"""
+    """SQLite + ChromaDB 双写"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute(
@@ -86,8 +93,20 @@ def store_memory(fact: str, keywords: list, importance: int = 5):
             datetime.now(),
         ),
     )
+    memory_id = c.lastrowid
     conn.commit()
     conn.close()
+
+    # 新增：同步写入 ChromaDB 向量库
+    try:
+        user_memory_rag.add_memory(
+            memory_id=str(memory_id),
+            fact=fact,
+            keywords=keywords,
+            importance=importance,
+        )
+    except Exception as e:
+        logger.error(f"[UserMemory] 向量写入失败: {e}")
 
 
 # 停用词：过滤无意义词，提高召回精度
@@ -149,21 +168,19 @@ def _extract_keywords(text: str) -> list[str]:
     return list(dict.fromkeys(keywords))
 
 
-def recall_memories(query: str, top_k: int = 5) -> list[dict]:
-    """召回：jieba分词 + 关键词模糊匹配 + 重要性排序"""
+def _recall_by_keywords(query: str, top_k: int = 5) -> list[dict]:
+    """原 jieba 关键词召回，保留作为 fallback"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
 
     keywords = _extract_keywords(query)
 
     if keywords:
-        # 每个关键词在fact和keywords字段里LIKE匹配
         conditions = " OR ".join(["(fact LIKE ? OR keywords LIKE ?)"] * len(keywords))
         params = []
         for kw in keywords:
             params.extend([f"%{kw}%", f"%{kw}%"])
     else:
-        # 没有任何有效关键词时，退化为时间排序（返回最近的记忆）
         conditions = "1=1"
         params = []
 
@@ -192,6 +209,34 @@ def recall_memories(query: str, top_k: int = 5) -> list[dict]:
         }
         for r in rows
     ]
+
+
+def recall_memories(query: str, top_k: int = 5) -> list[dict]:
+    """
+    混合召回：ChromaDB 语义召回（优先） + jieba 关键词召回（兜底）
+    """
+    # === 1. 向量语义召回 ===
+    vec_results = []
+    try:
+        vec_results = user_memory_rag.recall(query, top_k=3, min_importance=1)
+    except Exception as e:
+        logger.error(f"[UserMemory] 召回失败: {e}")
+
+    # === 2. 原 jieba 关键词召回 ===
+    kw_results = _recall_by_keywords(query, top_k=3)
+
+    # === 3. 合并去重（id 为 key）===
+    seen = set()
+    merged = []
+    for r in vec_results + kw_results:
+        mid = r.get("id")
+        if mid and mid not in seen:
+            seen.add(mid)
+            merged.append(r)
+
+    # 按 importance 降序，取 top_k
+    merged.sort(key=lambda x: x.get("importance", 0), reverse=True)
+    return merged[:top_k]
 
 
 def update_accessed(memory_id: int):
