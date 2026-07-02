@@ -81,6 +81,12 @@ class UserMemoryRAG:
             )
 
         logger.info(f"[UserMemory] 召回 {len(memories)} 条, query={query[:20]}...")
+
+        for m in memories:
+            logger.info(
+                f"[UserMemory]   → id={m['id']}, fact={m['fact'][:30]}, distance={m.get('distance')}"
+            )
+
         return memories
 
     def delete(self, memory_id: str) -> None:

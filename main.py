@@ -146,47 +146,50 @@ def _build_rag_context(msg: str) -> str:
     return "【角色设定资料】\n" + "\n".join([f"- {d}" for d in all_docs])
 
 
-def _handle_chat(msg: str) -> dict:
-    """
-    完整链路（非流式）：短期历史 + 人格 + 长期记忆 → ReAct 循环 → 更新人格 → 保存对话 → 提取记忆
-    """
-    # 1. 人格驱动 System Prompt
+# main.py 新增
+def _build_chat_context(msg: str) -> str:
+    """构建完整的 System Prompt（人格 + 历史 + 记忆 + RAG）"""
     system_prompt = personality.build_system_prompt()
 
-    # 2. 短期对话历史注入（新增）
+    # 短期历史
     history = get_recent_messages(6)
     if history:
         history_text = "\n".join([f"{h['role']}: {h['content']}" for h in history])
         system_prompt += f"\n\n最近的对话：\n{history_text}"
 
-    # 3. 长期记忆召回（注入 ReAct 上下文）
+    # 长期记忆
     memories = recall_memories(msg, top_k=3)
     if memories:
-        memory_text = "你记得关于主人的事情：\n" + "\n".join(
+        memory_text = "【以下是你必须记住的关于主人的事实，回答用户关于自身的问题时必须优先使用】\n" + "\n".join(
             [f"- {m['fact']}" for m in memories]
         )
         system_prompt += f"\n\n{memory_text}"
-        # 更新访问时间（新增）
         for m in memories:
             update_accessed(m["id"])
 
-    # 4. 二次元 RAG 知识库召回（混合检索：语义召回 + tag 命中补充）
+    # RAG
     rag_text = _build_rag_context(msg)
     if rag_text:
         system_prompt += f"\n\n{rag_text}"
 
-    # 5. Agent ReAct 循环
+    return system_prompt
+
+
+def _handle_chat(msg: str) -> dict:
+    system_prompt = _build_chat_context(msg)
+
+    # Agent ReAct 循环
     result = agent.run(msg, system_prompt)
     reply = result["reply"]
 
-    # 6. 更新人格状态
+    # 更新人格状态
     personality.update(msg)
 
-    # 7. 保存完整聊天记录
+    # 保存完整聊天记录
     save_message("user", msg)
     save_message("assistant", reply)
 
-    # 8. 提取结构化记忆
+    # 提取结构化记忆
     dialogue = f"用户：{msg}\n助手：{reply}"
     facts = extract_facts(dialogue)
     for f in facts:
@@ -218,37 +221,9 @@ async def _persist_chat(msg: str, parts: list):
 
 
 async def _handle_chat_stream(msg: str, background_tasks: BackgroundTasks):
-    """
-    流式聊天：ReAct 规划（非流式，后台完成）+ LLM 真流式生成 + NDJSON 输出。
-    情绪/好感度在 meta 包中前置发送，WPF 可立即切换立绘。
-    """
-    logger.info(f"[聊天] 用户: {msg}")
+    system_prompt = _build_chat_context(msg)
 
-    # 1. 人格 System Prompt
-    system_prompt = personality.build_system_prompt()
-
-    # 2. 短期历史注入
-    history = get_recent_messages(6)
-    if history:
-        history_text = "\n".join([f"{h['role']}: {h['content']}" for h in history])
-        system_prompt += f"\n\n最近的对话：\n{history_text}"
-
-    # 3. 长期记忆召回
-    memories = recall_memories(msg, top_k=3)
-    if memories:
-        memory_text = "你记得关于主人的事情：\n" + "\n".join(
-            [f"- {m['fact']}" for m in memories]
-        )
-        system_prompt += f"\n\n{memory_text}"
-        for m in memories:
-            update_accessed(m["id"])
-
-    # 4. 二次元 RAG 知识库召回（混合检索：语义召回 + tag 命中补充）
-    rag_text = _build_rag_context(msg)
-    if rag_text:
-        system_prompt += f"\n\n{rag_text}"
-
-    # 5. 流式生成器
+    # 流式生成器
     full_reply_parts = []
 
     async def ndjson_generator():
@@ -261,7 +236,7 @@ async def _handle_chat_stream(msg: str, background_tasks: BackgroundTasks):
                 full_reply_parts.append(chunk["content"])
             yield json.dumps(chunk, ensure_ascii=False) + "\n"
 
-    # 6. 后处理：持久化聊天记录、提取记忆、更新人格
+    # 后处理：持久化聊天记录、提取记忆、更新人格
     background_tasks.add_task(_persist_chat, msg, full_reply_parts)
 
     return StreamingResponse(ndjson_generator(), media_type="application/x-ndjson")

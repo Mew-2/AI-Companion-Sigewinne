@@ -78,10 +78,25 @@ def extract_facts(dialogue: str) -> list[dict]:
         return []
 
 
+def _normalize_fact(text: str) -> str:
+    """去重归一化：去末尾标点符号和空白"""
+    return text.rstrip("。！？，,.!?;；:： \t\n")
+
+
 def store_memory(fact: str, keywords: list, importance: int = 5):
     """SQLite + ChromaDB 双写"""
+    fact = _normalize_fact(fact)
+
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+
+    # 去重：归一化后去标点比较，防 "用户喜欢喝奶茶。" ≠ "用户喜欢喝奶茶"
+    for row in c.execute("SELECT id, fact FROM memories"):
+        if _normalize_fact(row[1]) == fact:
+            conn.close()
+            logger.info(f"[UserMemory] 记忆已存在，跳过写入: {fact[:30]}...")
+            return
+
     c.execute(
         """INSERT INTO memories (fact, keywords, importance, created_at, last_accessed)
            VALUES (?, ?, ?, ?, ?)""",
@@ -97,7 +112,7 @@ def store_memory(fact: str, keywords: list, importance: int = 5):
     conn.commit()
     conn.close()
 
-    # 新增：同步写入 ChromaDB 向量库
+    # 同步写入 ChromaDB 向量库
     try:
         user_memory_rag.add_memory(
             memory_id=str(memory_id),
@@ -229,7 +244,7 @@ def recall_memories(query: str, top_k: int = 5) -> list[dict]:
     seen = set()
     merged = []
     for r in vec_results + kw_results:
-        mid = r.get("id")
+        mid = str(r.get("id"))
         if mid and mid not in seen:
             seen.add(mid)
             merged.append(r)

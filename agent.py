@@ -41,8 +41,17 @@ class ReActAgent:
             action_str = self._extract_action(llm_output)
 
             if not action_str:
+                # LLM 直接角色回答了（无格式前缀），当作 Final Answer 复用
+                if len(llm_output) > 10 and "Action:" not in llm_output:
+                    direct_answer = llm_output.strip()
+                    logger.info(f"[Step {step}] LLM 直接回答（无格式前缀），作为最终回复")
+                    break
+
                 logger.warning(f"[Step {step}] 格式异常，终止规划")
-                logger.warning(f"[Step {step}] LLM原始输出:\n{llm_output}")
+                logger.warning(
+                    f"[Step {step}] LLM原始输出 (len={len(llm_output)}): {repr(llm_output[:800])}"
+                )
+                logger.warning(f"[Step {step}] system_ctx 前300字: {system_ctx[:300]}")
                 break
 
             thoughts.append(thought)
@@ -152,7 +161,10 @@ class ReActAgent:
         yield "这是模拟流式回复，实际接入 LLM 后替换。"
 
     def _build_context(self, system_prompt: str, user_msg: str) -> tuple[str, str]:
-        """返回 (system_content, user_content)"""
+        """返回 (system_content, user_content)
+        system_prompt 包含人格、历史、记忆、RAG，必须保留。
+        工具规则追加在后面，确保 LLM 既能看到上下文，又能正确决策工具。
+        """
         tools_desc = "\n".join(
             [
                 f"- {name}{self._get_signature(func)}"
@@ -160,54 +172,42 @@ class ReActAgent:
             ]
         )
 
-        # 只留极简身份标识 + 工具规则，不渗入完整人设/RAG/历史，避免角色扮演干扰工具决策
-        system_content = f"""你是希格雯，同时也需要判断用户是否需要调用实时工具来获取信息。
+        # 把完整 system_prompt 放前面，工具决策规则追加在后面
+        system_content = f"""{system_prompt}
 
-你可以使用以下工具：
-{tools_desc}
+    【工具决策规则——你是希格雯，判断是否需要调用工具】
+    你可以使用以下工具：
+    {tools_desc}
 
-【硬规则——必须调用工具】
-- 用户询问天气、气温、温度、空气质量、湿度、风向等实时/时效性信息 → 必须调用 weather 或 search
-- 用户询问实时新闻、热搜、股价、比赛结果等 → 必须调用 search
-- 用户说"看下/查一下/看一下/搜一下/搜索/查查/查一查" + 天气/城市/新闻等 → 必须调用对应工具
-- 即使你了解一些背景常识，对于实时数据也不能绕过工具
+    【硬规则——必须调用工具】
+    - 用户询问天气、气温、温度、空气质量、湿度、风向等实时/时效性信息 → 必须调用 weather 或 search
+    - 用户询问实时新闻、热搜、股价、比赛结果等 → 必须调用 search
+    - 用户说"看下/查一下/看一下/搜一下/搜索/查查/查一查" + 天气/城市/新闻等 → 必须调用对应工具
+    - 即使你了解一些背景常识，对于实时数据也不能绕过工具
 
-【格式】
-Thought: 分析是否需要工具
-Action: 工具名称(参数)
+    【格式】
+    Thought: 分析是否需要工具
+    Action: 工具名称(参数)
 
-当不需要工具时，直接输出：
-Final Answer: 回复内容
+    当不需要工具时，直接输出：
+    Final Answer: 回复内容
 
-注意：
-- 每次只能调用一个工具
-- Action 参数必须用英文单引号包裹，如 weather(city='上海')
+    注意：
+    - 每次只能调用一个工具
+    - Action 参数必须用英文单引号包裹，如 weather(city='上海')
 
-示例：
+    示例：
+    Question: 北京今天天气怎么样？
+    Thought: 用户问天气，需要调用天气工具
+    Action: weather(city='北京')
 
-Question: 北京今天天气怎么样？
-Thought: 用户问天气，需要调用天气工具
-Action: weather(city='北京')
+    Question: 你头发是什么颜色的？
+    Thought: 用户问的是角色设定常识，不需要工具
+    Final Answer: 主人，我的头发是蓝色的哦~
 
-Question: 查一下上海今天天气
-Thought: 用户想查天气，需要调用天气工具
-Action: weather(city='上海')
-
-Question: 看下上海天气
-Thought: 用户想看天气，需要调用天气工具
-Action: weather(city='上海')
-
-Question: 搜一下今天的新闻
-Thought: 用户想搜索新闻，需要调用搜索工具
-Action: search(query='今天新闻')
-
-Question: 你头发是什么颜色的？
-Thought: 用户问的是角色设定常识，不需要工具
-Final Answer: 主人，我的头发是蓝色的哦~
-
-Question: 你好
-Thought: 用户打招呼，不需要工具
-Final Answer: 主人好呀~"""
+    Question: 你好
+    Thought: 用户打招呼，不需要工具
+    Final Answer: 主人好呀~"""
 
         user_content = f"Question: {user_msg}\nThought:"
 
