@@ -4,7 +4,15 @@
 
 > 本项目以《原神》角色"希格雯"为交互载体，验证 AI 陪伴系统的技术可行性。核心架构（ReAct Agent / RAG / 双层记忆）可迁移至任意角色或企业客服场景。
 
+## 演示
+
+![演示](assets/converted.gif)
+
 ## 系统架构
+
+> 本项目分为前后端两个独立仓库：
+> - **后端**（本仓库）：FastAPI + ReAct Agent + RAG + 双层记忆
+> - **前端**：[MyAIPet](https://github.com/Mew-2/MyAIPet) — .NET 10 WPF 客户端，透明置顶窗体，支持 NDJSON 流式打字机与情绪立绘切换
 
 ```mermaid
 flowchart LR
@@ -68,8 +76,9 @@ flowchart LR
 ## 快速开始
 
 ```bash
-# 1. 克隆并进入项目
+# 1. 克隆后端（本仓库）和前端
 git clone https://github.com/Mew-2/AI-Companion-Sigewinne.git
+git clone https://github.com/Mew-2/MyAIPet.git
 cd ai-companion
 
 # 2. 创建虚拟环境（推荐）
