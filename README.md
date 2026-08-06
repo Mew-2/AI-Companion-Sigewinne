@@ -6,7 +6,7 @@
 
 ## 演示
 
-![演示](assets/converted.gif)
+![演示](assets/demo.gif)
 
 ## 系统架构
 
