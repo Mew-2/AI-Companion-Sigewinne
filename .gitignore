@@ -11,3 +11,4 @@ logs/
 *.log
 chroma_db/
 data/
+.workbuddy/

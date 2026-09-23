@@ -9,7 +9,7 @@ class ChatRequest(BaseModel):
 
 class MemoryItem(BaseModel):
     fact: str
-    keywords: Optional[str] = None
+    keywords: Optional[List[str]] = None
     importance: Optional[int] = 5
 
 

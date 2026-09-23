@@ -16,7 +16,7 @@ from test_api import (
 from memory_service import extract_facts, store_memory, recall_memories, update_accessed
 from personality_state import PersonalityState
 
-from schemas import ChatRequest, ChatResponse
+from schemas import ChatRequest, ChatResponse, MemoryItem
 from exceptions import setup_exception_handlers, LLMTimeoutException, CompanionException
 
 from agent import ReActAgent
@@ -146,9 +146,21 @@ def _build_rag_context(msg: str) -> str:
     return "【角色设定资料】\n" + "\n".join([f"- {d}" for d in all_docs])
 
 
+def _memory_items(memories: list) -> list[dict]:
+    """把召回结果规整为响应契约的三字段形状（非流式/流式共用，防再次漂移）。"""
+    return [
+        MemoryItem(
+            fact=m["fact"],
+            keywords=m.get("keywords"),
+            importance=m.get("importance", 5),
+        ).model_dump()
+        for m in memories
+    ]
+
+
 # main.py 新增
-def _build_chat_context(msg: str) -> str:
-    """构建完整的 System Prompt（人格 + 历史 + 记忆 + RAG）"""
+def _build_chat_context(msg: str) -> tuple[str, list]:
+    """构建完整的 System Prompt（人格 + 历史 + 记忆 + RAG），并返回本轮召回的长期记忆。"""
     system_prompt = personality.build_system_prompt()
 
     # 短期历史
@@ -172,11 +184,11 @@ def _build_chat_context(msg: str) -> str:
     if rag_text:
         system_prompt += f"\n\n{rag_text}"
 
-    return system_prompt
+    return system_prompt, memories
 
 
 def _handle_chat(msg: str) -> dict:
-    system_prompt = _build_chat_context(msg)
+    system_prompt, memories = _build_chat_context(msg)
 
     # Agent ReAct 循环
     result = agent.run(msg, system_prompt)
@@ -199,6 +211,8 @@ def _handle_chat(msg: str) -> dict:
         "reply": reply,
         "emotion": personality.emotion,
         "affection": personality.affinity,
+        "recalled_memories": memories,
+        "used_tool": result.get("used_tool"),
     }
 
 
@@ -221,7 +235,7 @@ async def _persist_chat(msg: str, parts: list):
 
 
 async def _handle_chat_stream(msg: str, background_tasks: BackgroundTasks):
-    system_prompt = _build_chat_context(msg)
+    system_prompt, memories = _build_chat_context(msg)
 
     # 流式生成器
     full_reply_parts = []
@@ -232,6 +246,7 @@ async def _handle_chat_stream(msg: str, background_tasks: BackgroundTasks):
                 # 用旧状态（上一条消息后的值），流结束后再更新
                 chunk["emotion"] = personality.emotion
                 chunk["affection"] = personality.affinity
+                chunk["recalled_memories"] = _memory_items(memories)
             elif chunk["type"] == "text":
                 full_reply_parts.append(chunk["content"])
             yield json.dumps(chunk, ensure_ascii=False) + "\n"
@@ -251,6 +266,8 @@ async def chat_post(request: ChatRequest):
             reply=result["reply"],
             emotion=result["emotion"],
             affection=result["affection"],
+            recalled_memories=_memory_items(result["recalled_memories"]),
+            used_tool=result["used_tool"],
         )
     except TimeoutError:
         raise LLMTimeoutException()
@@ -274,7 +291,14 @@ async def chat_stream(request: ChatRequest, background_tasks: BackgroundTasks):
 
         # 降级：返回包含错误信息的流
         async def error_stream():
-            yield json.dumps({"type": "meta", "emotion": "sad", "affection": 0}) + "\n"
+            yield json.dumps(
+                {
+                    "type": "meta",
+                    "emotion": "sad",
+                    "affection": 0,
+                    "recalled_memories": [],
+                }
+            ) + "\n"
             yield json.dumps(
                 {"type": "text", "content": "希格雯的连接断开了，请稍后再试..."}
             ) + "\n"

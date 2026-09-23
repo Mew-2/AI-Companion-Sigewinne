@@ -8,3 +8,4 @@ chroma_db
 chat.db
 logs
 data/
+.workbuddy/
