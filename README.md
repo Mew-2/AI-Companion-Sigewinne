@@ -65,31 +65,28 @@ flowchart LR
 3. `ReActAgent` 决策是否需要调用工具（和风天气 / 博查搜索），最终调用 DeepSeek LLM 生成回复。
 4. 回复返回客户端；流式接口同时通过后台任务持久化消息、提取长期记忆、更新人格状态。
 
-## 快速开始
+## 快速开始（Docker，推荐）
 
 ```bash
-# 1. 克隆并进入项目
 git clone https://github.com/Mew-2/AI-Companion-Sigewinne.git
-cd ai-companion
+cd AI-Companion-Sigewinne
+cp .env.example .env   # 填入 DEEPSEEK_API_KEY、HEFENG_KEY 等
+docker compose up -d --build
+```
 
-# 2. 创建虚拟环境（推荐）
+打开 http://localhost:8000/docs 调试接口。首次启动自动初始化数据库与 92 条角色知识库；数据持久化在 `./data/`，重建容器不丢失。
+
+## 本地开发（venv）
+
+```bash
+git clone https://github.com/Mew-2/AI-Companion-Sigewinne.git
+cd AI-Companion-Sigewinne
+cp .env.example .env   # 填入 DEEPSEEK_API_KEY、HEFENG_KEY 等
 python -m venv venv
-source venv/bin/activate  # Linux/Mac
-# venv\Scripts\activate  # Windows
-
-# 3. 安装依赖
+source venv/bin/activate  # Linux/Mac；Windows 用 venv\Scripts\activate
 pip install -r requirements.txt
-
-# 4. 配置环境变量
-cp .env.example .env
-# 编辑 .env，填入 DEEPSEEK_API_KEY、HEFENG_KEY 等
-
-# 5. 一键初始化数据库与知识库
-python reset_db.py
-
-# 6. 启动服务
-python main.py
-# 访问 http://localhost:8000/docs 查看 Swagger API 文档
+python reset_db.py        # 初始化数据库与知识库
+python main.py            # http://localhost:8000/docs
 ```
 
 ## 技术栈

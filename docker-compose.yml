@@ -1,0 +1,12 @@
+services:
+  sigewinne:
+    build: .
+    container_name: sigewinne
+    ports:
+      - "8000:8000"
+    env_file: .env
+    volumes:
+      - ./data/chroma_db:/app/chroma_db
+      - ./data/chat.db:/app/chat.db
+      - ./data/logs:/app/logs
+    restart: unless-stopped

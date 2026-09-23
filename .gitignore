@@ -10,3 +10,4 @@ dev_test.py
 logs/
 *.log
 chroma_db/
+data/
