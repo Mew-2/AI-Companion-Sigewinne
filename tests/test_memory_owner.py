@@ -32,7 +32,7 @@ def test_recall_filters_by_owner(monkeypatch):
     monkeypatch.setattr(
         ms.user_memory_rag,
         "recall",
-        lambda q, top_k=5, min_importance=1: [
+        lambda q, top_k=5, min_importance=1, max_distance=None: [
             {"id": 1, "fact": "主人喜欢喝奶茶", "keywords": [], "importance": 9,
              "owner": "主人", "distance": 0.2},
             {"id": 2, "fact": "主人的同事喜欢美式咖啡", "keywords": [], "importance": 4,

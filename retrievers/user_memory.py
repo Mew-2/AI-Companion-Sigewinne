@@ -49,8 +49,14 @@ class UserMemoryRAG:
         )
         logger.info(f"[UserMemory] 写入 id={memory_id}, fact={fact[:30]}...")
 
-    def recall(self, query: str, top_k: int = 5, min_importance: int = 1) -> list[dict]:
-        """语义召回"""
+    def recall(
+        self,
+        query: str,
+        top_k: int = 5,
+        min_importance: int = 1,
+        max_distance: float | None = None,
+    ) -> list[dict]:
+        """语义召回。max_distance 非空时丢弃距离超过阈值的弱相关结果。"""
         where_clause = (
             {"importance": {"$gte": min_importance}} if min_importance > 1 else None
         )
@@ -82,6 +88,20 @@ class UserMemoryRAG:
                     ),
                 }
             )
+
+        # 相关性阈值：距离越大越不相关，超过阈值直接丢弃
+        if max_distance is not None:
+            kept = [
+                m
+                for m in memories
+                if m.get("distance") is None or m["distance"] <= max_distance
+            ]
+            dropped = len(memories) - len(kept)
+            if dropped:
+                logger.info(
+                    f"[UserMemory] 阈值过滤：丢弃 {dropped} 条 distance>{max_distance}"
+                )
+            memories = kept
 
         logger.info(f"[UserMemory] 召回 {len(memories)} 条, query={query[:20]}...")
 

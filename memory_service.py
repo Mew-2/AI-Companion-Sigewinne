@@ -223,14 +223,16 @@ def _recall_by_keywords(query: str, top_k: int = 5) -> list[dict]:
 
     keywords = _extract_keywords(query)
 
-    if keywords:
-        conditions = " OR ".join(["(fact LIKE ? OR keywords LIKE ?)"] * len(keywords))
-        params = []
-        for kw in keywords:
-            params.extend([f"%{kw}%", f"%{kw}%"])
-    else:
-        conditions = "1=1"
-        params = []
+    if not keywords:
+        # 消灭 1=1 兜底：无有效关键词时不再"返回全表最重要的 N 条"，显式返回空
+        logger.info(f"[UserMemory] 关键词路无有效词，显式返回空: {query[:20]}...")
+        conn.close()
+        return []
+
+    conditions = " OR ".join(["(fact LIKE ? OR keywords LIKE ?)"] * len(keywords))
+    params = []
+    for kw in keywords:
+        params.extend([f"%{kw}%", f"%{kw}%"])
 
     c.execute(
         f"""
@@ -260,23 +262,40 @@ def _recall_by_keywords(query: str, top_k: int = 5) -> list[dict]:
     ]
 
 
+# 召回参数（重构：相关性阈值 + 融合重排）
+RECALL_CANDIDATE_K = 15      # 候选池大小（供过滤/重排）
+RECALL_MAX_DISTANCE = 0.8    # 绝对阈值：cosine 距离超过即丢弃
+RECALL_SCORE_MARGIN = 0.08   # 相对阈值：只保留与最佳结果分数差在 margin 内的记忆
+RECALL_W_DISTANCE = 0.9      # 融合打分权重：distance 为主
+RECALL_W_IMPORTANCE = 0.1    # importance 为辅
+
+
 def recall_memories(query: str, top_k: int = 5, owner: str | None = None) -> list[dict]:
     """
     混合召回：ChromaDB 语义召回（优先） + jieba 关键词召回（兜底）。
-    owner 缺省时按提问推断主体，只保留同一主体的记忆（隔离"同事/朋友"等他人事实）。
+
+    - owner 缺省时按提问推断主体，只保留同一主体的记忆（隔离他人事实）。
+    - 相关性阈值：distance 超阈值丢弃（user_memory.recall 内），再做"相对阈值"——
+      只保留与最佳结果同档的记忆，宁缺毋滥；无候选时显式返回空并记日志。
+    - 融合打分：distance 为主、importance 为辅（关键词路无 distance 给弱分）。
     """
     if owner is None:
         owner = _infer_query_owner(query)
 
-    # === 1. 向量语义召回 ===
+    # === 1. 向量语义召回（取较大候选池，供后续过滤/重排）===
     vec_results = []
     try:
-        vec_results = user_memory_rag.recall(query, top_k=3, min_importance=1)
+        vec_results = user_memory_rag.recall(
+            query,
+            top_k=RECALL_CANDIDATE_K,
+            min_importance=1,
+            max_distance=RECALL_MAX_DISTANCE,
+        )
     except Exception as e:
         logger.error(f"[UserMemory] 召回失败: {e}")
 
-    # === 2. 原 jieba 关键词召回 ===
-    kw_results = _recall_by_keywords(query, top_k=3)
+    # === 2. jieba 关键词召回（兜底）===
+    kw_results = _recall_by_keywords(query, top_k=RECALL_CANDIDATE_K)
 
     # === 3. 合并去重（id 为 key）===
     seen = set()
@@ -290,9 +309,30 @@ def recall_memories(query: str, top_k: int = 5, owner: str | None = None) -> lis
     # === 4. 主体过滤：只保留与提问主体一致的记忆 ===
     merged = [r for r in merged if (r.get("owner") or "主人") == owner]
 
-    # 按 importance 降序，取 top_k
-    merged.sort(key=lambda x: x.get("importance", 0), reverse=True)
-    return merged[:top_k]
+    if not merged:
+        logger.info("[UserMemory] 无候选记忆（语义路与关键词路均为空）")
+        return []
+
+    # === 5. 融合打分：distance 为主、importance 为辅 ===
+    def _score(m: dict) -> float:
+        imp = m.get("importance", 0) / 10.0
+        d = m.get("distance")
+        if d is None:  # 关键词路无距离信号，只给弱分
+            return 0.4 * imp
+        return RECALL_W_DISTANCE * (1.0 - d) + RECALL_W_IMPORTANCE * imp
+
+    for m in merged:
+        m["_score"] = _score(m)
+    merged.sort(key=lambda x: x["_score"], reverse=True)
+
+    # === 6. 相对相关性阈值：只保留与最佳结果同档的记忆 ===
+    best = merged[0]["_score"]
+    kept = [m for m in merged if m["_score"] >= best - RECALL_SCORE_MARGIN]
+    if not kept:
+        logger.info("[UserMemory] 阈值过滤后无相关记忆，显式返回空")
+        return []
+
+    return kept[:top_k]
 
 
 def update_accessed(memory_id: int):
