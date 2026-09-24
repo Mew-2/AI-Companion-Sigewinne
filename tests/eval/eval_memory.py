@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import os
 import shutil
 import sqlite3
@@ -347,7 +348,7 @@ def build_report(summary: dict, results: list[dict], args, elapsed: float) -> st
                 continue
             add(f"### {label}（{len(cat_failed)}/{len([r for r in results if r['category'] == cat])} 失败）")
             add("")
-            for r in cat_failed[:8]:
+            for r in cat_failed:
                 exp = r["expected"]
                 add(f"- **`{r['id']}`** · {r['difficulty']} · 写入 {r['seeded']} 条")
                 add(f"  - query：`{r['query']}`")
@@ -355,8 +356,6 @@ def build_report(summary: dict, results: list[dict], args, elapsed: float) -> st
                 got = "；".join(r["recalled_facts"]) or "（空）"
                 add(f"  - 实召：{got}")
                 add(f"  - 判定：hit_any={r['hit_any']}，hit_bad={r['hit_bad']}")
-            if len(cat_failed) > 8:
-                add(f"  - …… 其余 {len(cat_failed) - 8} 条同类失败略")
             add("")
 
     # 失败模式聚类
@@ -417,6 +416,48 @@ def build_report(summary: dict, results: list[dict], args, elapsed: float) -> st
     return "\n".join(lines) + "\n"
 
 
+def _setup_trace() -> Path:
+    """把根 logger 的 INFO（含 [UserMemory] 内部召回行）与逐用例明细写进带日期的日志。
+
+    写到仓库 `logs/`（已被 .gitignore 忽略），文件名带时间戳，便于事后查看。
+    """
+    logs_dir = ROOT / "logs"
+    logs_dir.mkdir(exist_ok=True)
+    path = logs_dir / f"eval_recall_trace_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    handler = logging.FileHandler(path, encoding="utf-8")
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s")
+    )
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    root.addHandler(handler)
+    return path
+
+
+def _trace_case(trace: logging.Logger, r: dict) -> None:
+    exp = r["expected"]
+    trace.info("=" * 70)
+    trace.info(
+        "[%s] category=%s difficulty=%s seeded=%d",
+        r["id"], r["category"], r["difficulty"], r["seeded"],
+    )
+    trace.info("  query: %s", r["query"])
+    trace.info(
+        "  expected: should_recall=%s match_any=%s must_not_match=%s",
+        exp["should_recall"], exp.get("match_any"), exp.get("must_not_match"),
+    )
+    if r["recalled_facts"]:
+        for f, d in zip(r["recalled_facts"], r["distances"]):
+            trace.info("  recalled: %s  (distance=%s)", f, d)
+    else:
+        trace.info("  recalled: (空)")
+    trace.info(
+        "  verdict: passed=%s hit_any=%s hit_bad=%s",
+        r["passed"], r["hit_any"], r["hit_bad"],
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="记忆召回评测")
     parser.add_argument("--top-k", type=int, default=3, help="召回条数，默认 3（与生产一致）")
@@ -428,7 +469,17 @@ def main() -> int:
         default="real",
         help="real=真实 Chroma 向量检索（默认）；stub=替身检索，仅用于验证评测流水线自身",
     )
+    parser.add_argument(
+        "--trace",
+        action="store_true",
+        help="把逐用例召回明细 + [UserMemory] 内部日志写入 logs/eval_recall_trace_<时间>.log",
+    )
     args = parser.parse_args()
+
+    trace = logging.getLogger("EVAL_TRACE")
+    trace_path = _setup_trace() if args.trace else None
+    if trace_path:
+        print(f"[eval] trace 日志: {trace_path}")
 
     if args.backend == "stub":
         memory_service.user_memory_rag = _StubRag()
@@ -453,17 +504,20 @@ def main() -> int:
     results: list[dict] = []
     for i, case in enumerate(cases, 1):
         try:
-            results.append(run_case(case, args.top_k))
+            r = run_case(case, args.top_k)
         except Exception as exc:
             print(f"[eval] !! {case['id']} 执行异常: {exc}")
-            results.append({
+            r = {
                 "id": case["id"], "category": case["category"],
                 "difficulty": case["difficulty"], "query": case["query"],
                 "expected": case["expected"], "seeded": len(case["setup_turns"]),
                 "recalled_n": 0, "seed_ms": 0.0, "latency_ms": 0.0, "tokens": 0,
                 "distances": [], "passed": False, "hit_any": False, "hit_bad": False,
                 "recalled_facts": [f"<异常: {exc}>"],
-            })
+            }
+        results.append(r)
+        if trace_path:
+            _trace_case(trace, r)
         if i % 20 == 0 or i == len(cases):
             ok = sum(r["passed"] for r in results)
             print(f"[eval] {i}/{len(cases)} 通过 {ok} ({ok / len(results) * 100:.1f}%)")
