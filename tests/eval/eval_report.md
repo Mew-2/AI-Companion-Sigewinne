@@ -1,8 +1,8 @@
 # 记忆召回评测报告
 
-> 生成时间：2026-09-24 18:44:40｜用例集：`memory_recall_cases.json`（sha256:a0c9dc6d7d89）
+> 生成时间：2026-09-24 18:47:39｜用例集：`memory_recall_cases.json`（sha256:a0c9dc6d7d89）
 > 召回 top_k：3（与 main.py:173 `recall_memories(msg, top_k=3)` 一致）
-> 总耗时：34.3s｜token 计量：tiktoken cl100k_base（近似 DeepSeek 分词）
+> 总耗时：35.4s｜token 计量：tiktoken cl100k_base（近似 DeepSeek 分词）
 > 召回后端：ChromaDB + `BAAI/bge-small-zh-v1.5`（真实向量检索）
 
 **评测范围**：只覆盖检索层（`store_memory` 写入 + `recall_memories` 召回 + importance 排序截断）。
@@ -17,11 +17,11 @@
 | 通过 | 118 |
 | **总准确率** | **98.3%** |
 | 平均召回延迟 | 15.5 ms |
-| 中位召回延迟 | 15.2 ms |
+| 中位召回延迟 | 15.4 ms |
 | P95 召回延迟 | 19.1 ms |
-| 最大召回延迟 | 22.4 ms |
-| 平均每用例写入耗时 | 254.1 ms（写入 1137 条） |
-| **平均单条记忆写入延迟** | **26.8 ms** |
+| 最大召回延迟 | 22.6 ms |
+| 平均每用例写入耗时 | 263.7 ms（写入 1137 条） |
+| **平均单条记忆写入延迟** | **27.8 ms** |
 | 平均召回条数 | 1.17 |
 | **平均注入 token** | **21.8**（中位 19.0） |
 
