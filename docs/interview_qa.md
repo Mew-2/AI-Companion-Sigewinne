@@ -1,10 +1,11 @@
 # 希格雯桌宠 — 面试深挖题库（50 题）
 
 > 定位：以"资深 AI 应用工程师面试官"视角，针对本仓库真实实现出题。
-> 锚点基准：**rev3**（2026-09-23）。`main.py` = 316 行、`memory_service.py` = 271 行、`agent.py` = 274 行、`personality_state.py` = 158 行、`schemas.py` = 21 行、`retrievers/user_memory.py` = 106 行、`retrievers/anime_kb.py` = 71 行、`init_anime_kb.py` = 845 行（92 条文档）。
+> 锚点基准：**rev4**（2026-09-24，记忆系统重构 + 人格死锁修复）。`main.py` = 316 行、`memory_service.py` = 459 行、`agent.py` = 273 行、`personality_state.py` = 166 行、`schemas.py` = 21 行、`retrievers/user_memory.py` = 128 行、`retrievers/anime_kb.py` = 70 行、`init_anime_kb.py` = 845 行（92 条文档）。
 > 代码改动后行号会漂，重算方法见 `PROJECT_BRIEF.md` §9。
 > 🔥 = 压力题，共 **10** 个（索引见文末）。压力题的共同特征：**答"有"就露馅，正确答法通常是先纠正题目前提**。
 > 所有"实测"均可在 `logs/agent.log`（573 行）与 `chroma_db/`、`chat.db` 里复核。
+> **rev4 变更摘要**：记忆召回从"importance 硬排"改为"distance 融合重排 + 相关性阈值 + 主体过滤 + 遗忘机制"，评测总准确率 60.8% → 98.3%（五分类：事实/长上下文/情感/干扰项均 100%，遗忘 91.7%）；修复 `personality_state.py` 的 sad 死锁。受影响题目已逐条改写：Q2、Q4、Q7、Q10、Q11、Q20、Q29、Q50。
 
 | 分组 | 题号 | 压力题 |
 |---|---|---|
@@ -28,13 +29,13 @@
   - `messages` 表无 `session_id`、无清理、永久堆积（`schemas.py:7` 的 `session_id` 收下即丢）。
 
 ### Q2｜长期记忆为什么要 SQLite + Chroma 双写？两边各存什么？
-**锚点**：`memory_service.py:86-124`、`retrievers/user_memory.py:27-48`
+**锚点**：`memory_service.py:178-277`、`retrievers/user_memory.py:27-49`
 - **考察意图**：向量库与关系库的职责边界，以及双写一致性的代价意识。
 - **答题要点**：
-  - SQLite `memories` 是**权威源**：`fact/keywords/importance/created_at/last_accessed`（`memory_service.py:30-39`），带去重、去排序、供关键词 LIKE 检索。
-  - Chroma `user_memories` 是**派生的向量索引**：只存 `documents=[fact]` + metadata（`user_memory.py:36-47`），用于语义召回。
-  - 顺序是"先 SQLite 拿 `lastrowid`（`:111`）→ 再用 `str(memory_id)` 写 Chroma"，id 是两边的唯一关联键。这也解释了召回侧为什么要 `str(r.get("id"))` 统一类型：向量路 id 是 str、关键词路是 int（`memory_service.py:247`）。
-  - 代价：Chroma 写失败只 `logger.error` 不补偿（`:123-124`），两边可能长期漂移；没有事务、没有对账任务。
+  - SQLite `memories` 是**权威源**：`fact/keywords/importance/owner/status/access_count/created_at/last_accessed`（`memory_service.py:30-46`），带去重、去排序、供关键词 LIKE 检索。`owner`（主人/他人）、`status`（active/superseded/expired）、`access_count` 是 rev4 记忆重构新增的列，旧库通过 `PRAGMA table_info` + `ALTER TABLE` 幂等迁移补列。
+  - Chroma `user_memories` 是**派生的向量索引**：只存 `documents=[fact]` + metadata（含 `owner`，`user_memory.py:37-50`），用于语义召回。
+  - 顺序是"先 SQLite 拿 `lastrowid`（`:232`）→ 再用 `str(memory_id)` 写 Chroma"，id 是两边的唯一关联键。这也解释了召回侧为什么要 `str(r.get("id"))` 统一类型：向量路 id 是 str、关键词路是 int。
+  - 代价：Chroma 写失败只 `logger.error` 不补偿，两边可能长期漂移；没有事务、没有对账任务。rev4 的"冲突覆盖/时效软删除"会**同时**改 SQLite `status` 并 `user_memory.delete()` 撤出向量，但仍是两步非事务操作。
 
 ### Q3｜写入去重为什么用"全表逐行比对"？这样写有什么问题？
 **锚点**：`memory_service.py:81-83, 94-98`
@@ -45,14 +46,13 @@
   - 更硬的缺陷：**check-then-act 非原子**。并发两次相同写入都可能通过检查再各插一行（无唯一索引兜底）。正解是加 `normalized_fact` 列 + `UNIQUE` 索引，或 `INSERT ... ON CONFLICT DO NOTHING`，把归一化下沉到写入路径。
 
 ### Q4｜🔥 压力题｜`_recall_by_keywords` 里的 `1=1` 兜底是什么？什么时候走到？后果多严重？
-**锚点**：`memory_service.py:193-200`
-- **考察意图**：能不能发现这条"看起来有召回、实际无相关性"的隐蔽路径——这是本系统最脏的一段代码。
+**锚点**：`memory_service.py:299-320`（rev4 已修复）
+- **考察意图**：能不能发现/讲清这条"看起来有召回、实际无相关性"的隐蔽路径——它曾是本系统最脏的一段代码。
 - **答题要点**：
-  - 逻辑是：query 分词 → 过滤停用词/长度/纯符号（`:166-183`）→ **若 `keywords` 为空，则 `conditions = "1=1"`**（`:198-200`）。
-  - `conditions` 直接 f-string 进 SQL（`:202-211`），于是 `WHERE 1=1 ORDER BY importance DESC, last_accessed DESC LIMIT 3` —— **返回整表里"最重要 + 最近访问"的 3 条**，与 query 完全无关。
-  - 触发门槛极低：停用词表把"喜欢/记得/知道/告诉/什么/怎么/为什么/我/你/吗/呢"全滤掉了（`:128-163`）。"你记得我喜欢什么吗？"这类**口语短问句**几乎必然被滤空 → 静默返回高权重随机记忆。
-  - 为什么危险：它**不报错、不返回空、日志看不出异常**（日志只记"召回 N 条"），从现象上完全像"召回到了有用的东西"。这类"沉默的错答案"比报错难查得多。
-  - 修法：`if not keywords: return []`（让语义路独立承担），或改成显式 `LIMIT 0`；根本上应该给关键词路也做相关性排序（当前 `ORDER BY importance` 本身就是错的）。
+  - **先纠正前提（若被问"现在还有没有"）**：rev4 记忆重构已删除该兜底。旧实现：query 分词 → 过滤停用词/长度/纯符号 → **若 `keywords` 为空，则 `conditions = "1=1"`**，f-string 拼进 SQL 后成为 `WHERE 1=1 ORDER BY importance DESC, last_accessed DESC LIMIT 3`，**返回整表"最重要+最近访问"的 3 条**，与 query 完全无关。
+  - 触发门槛极低：停用词表把"喜欢/记得/知道/告诉/什么/怎么/为什么/我/你/吗/呢"全滤掉，"你记得我喜欢什么吗？"这类**口语短问句**几乎必然被滤空 → 静默返回高权重随机记忆。危险在于它**不报错、不返回空、日志看不出异常**，现象上完全像"召回到了有用的东西"。
+  - **当前实现**：`if not keywords: return []` 并打 `[UserMemory] 关键词路无有效词，显式返回空` 日志；召回主链 `recall_memories` 在两路都为空时显式返回 `[]` 并记 `无候选记忆`。关键词路 SQL 同时加了 `AND status='active'`。
+  - 可延伸：关键词路仍按 `ORDER BY importance` 排序（未做独立相关性重排），但它现在是**兜底**且结果会并入 `recall_memories` 的融合重排，所以"importance 当相关性"的残留问题只影响兜底路。
 
 ### Q5｜向量路和关键词路为什么用 id 去重而不是文本去重？哪一路优先？
 **锚点**：`memory_service.py:243-250`
@@ -72,14 +72,17 @@
   - 可质疑点：两路都只取 top3、合并最多 6 条再截 3（`:236,241,254`），**候选池太小**，没有给重排留空间。
 
 ### Q7｜🔥 压力题｜合并后按 `importance` 硬排，为什么这是本系统最核心的检索缺陷？
-**锚点**：`memory_service.py:252-254`、`retrievers/user_memory.py:77-79`
+**锚点**：`memory_service.py:374-444`（rev4 已修复）
 - **考察意图**：能否指出"采集了相关性指标却不用它做决策"这一典型失误。
 - **答题要点**：
-  - 事实：`merged.sort(key=lambda x: x.get("importance", 0), reverse=True)` 后 `[:top_k]`（`:253-254`）。`importance` 是**写入时 LLM 自评的重要性**（`:50`），与"这条记忆和本轮问题有多相关"完全无关。
-  - 直接后果：一条 `importance=9` 但无关的记忆（"主人讨厌香菜"）会挤掉 `importance=6` 但真正命中的"主人喜欢珍珠奶茶"。**相关性在排序这一步被丢掉**，用户感知是"它明明知道却答不出来"。
-  - `distance` 被白白浪费：`user_memory.recall` 把 `results["distances"]` 取出来了（`:77-79`），写进返回值、写进日志（`:85-88`），但**从不参与任何决策**。检索链路上唯一的相关性信号被采集后丢弃。
-  - 日志实证：`logs/agent.log:47` 记录 `id=2, fact=助手是蓝色头发，不是粉色, distance=0.7111` —— 0.71 的弱相关照样进 Prompt（且这条本身还是抽取粒度错误，见 Q39）。
-  - 正解：融合打分 `score = α·(1-distance) + β·normalize(importance)`，或"先按 distance 卡候选、再用 importance 做 tie-break"；同时把 distance 变成阈值闸门（如 >0.6 丢弃）。
+  - **先纠正前提（若被问"现在还是不是"）**：rev4 已改为 distance 为主的融合重排。旧实现是 `merged.sort(key=importance, reverse=True)` 后 `[:top_k]`——`importance` 是写入时 LLM 自评的重要性，与"这条记忆和本轮问题有多相关"完全无关；一条 `importance=9` 的无关记忆会挤掉 `importance=6` 的真正命中项。而 `user_memory.recall` 明明把 `distances` 取出来了，却从不参与任何决策。
+  - **当前实现**（`recall_memories`）：
+    1. 向量路取候选池 `RECALL_CANDIDATE_K=15`，`user_memory.recall(max_distance=RECALL_MAX_DISTANCE=0.8)` 先做**绝对阈值**过滤，超阈值直接丢；
+    2. 合并去重后按 `score = 0.9·(1-distance) + 0.1·(importance/10)` 融合打分（distance 为主、importance 仅做 tie-break），再乘遗忘因子 `_recency_factor`；
+    3. 做**相对阈值**——只保留与最佳结果分差在 `RECALL_SCORE_MARGIN=0.08` 内的记忆，宁缺毋滥；
+    4. 无候选或全被过滤时**显式返回空**并记日志。
+  - 效果（`tests/eval/eval_report.md`）：干扰项类 4.2% → 100%，总准确率 60.8% → 98.3%。
+  - 可质疑点（诚实说）：相对阈值 + 单候选倾向会让"平均召回条数"下降，是**用 recall 换 precision**；权重与阈值是经验值，缺数据支撑，记忆规模上去后要重调；`importance` 仍以 0.1 的权重参与，并非完全移除。
 
 ### Q8｜`store_memory` 里 SQLite 与 Chroma 的写入顺序能反过来吗？
 **锚点**：`memory_service.py:90-124`
@@ -98,26 +101,27 @@
   - 没有"本轮无可用记忆"的显式信号，也没有让模型自评"这些记忆跟问题有关吗"的机会。改进：给每条记忆附 `distance`/重要性，让模型自行取舍；或干脆把指令弱化成"以下是一些可能相关的背景"。
 
 ### Q10｜召回后 `update_accessed` 到底起什么作用？它在排序里有隐性影响吗？
-**锚点**：`main.py:179-180`、`memory_service.py:257-266, 207`
+**锚点**：`main.py:179-180`、`memory_service.py:446-456, 356-372`
 - **考察意图**：是否愿意追一个小字段的真实影响力，而不是当它"没用"。
 - **答题要点**：
-  - 写入：每轮对**进入 Prompt 的每条记忆**逐条 `UPDATE memories SET last_accessed=?`（`main.py:180` → `memory_service.py:261-264`），无批量、无节流，N 条记忆就是 N 次 SQLite 连接开关。
-  - 隐性影响：关键词路的 SQL 是 `ORDER BY importance DESC, last_accessed DESC`（`:207`）——在 `importance` 相同的候选里，**刚被访问过的优先**。也就是说 `last_accessed` 是一个二阶 tie-break，不是无用字段。
-  - 但它**触发不了任何遗忘**：没有基于 `last_accessed` 的淘汰、降权、TTL（详见 Q11）。所以它的净效果是"让热点记忆在同分候选里更容易被反复取用"→ 潜在的**马太效应**（越被取用越容易被取用），而不是"冷记忆自然淡出"。
+  - 写入：每轮对**进入 Prompt 的每条记忆**逐条 `update_accessed`（`main.py:180`），无批量、无节流，N 条记忆就是 N 次 SQLite 连接开关。rev4 起它**同时累加 `access_count`**：`UPDATE memories SET last_accessed=?, access_count=COALESCE(access_count,0)+1`。
+  - 隐性影响一：关键词路 SQL 仍是 `ORDER BY importance DESC, last_accessed DESC`——同分候选里"刚被访问过的优先"。
+  - 隐性影响二（rev4 新增）：遗忘因子 `_recency_factor = exp(-λ·天数) × (1+ln(1+access_count))`——`last_accessed` 决定**时间衰减**、`access_count` 提供**访问频率加成**。也就是说，它现在真的会驱动"遗忘/降权"：久未访问的记忆衰减，高频访问的记忆更抗遗忘。
+  - 需要指出的副作用：频率加成会强化**马太效应**（越被取用越容易被取用），当前没有对 `access_count` 的上限约束，长期可能让少数记忆垄断召回。
+  - 对比 rev3：那时 `last_accessed` 只写不参与淘汰，净效果仅是"同分时热点优先"；rev4 才第一次把它接进遗忘决策。
 
 ### Q11｜🔥 压力题｜遗忘机制里的衰减函数为什么这么选？
-**锚点**：全仓检索；`retrievers/user_memory.py:92-93`、`memory_service.py:236, 253`
-- **考察意图**：**这是一道前提错误的题。** 考的是敢不敢当场纠正前提，而不是顺着问题编一个函数出来。
+**锚点**：`memory_service.py:96-176, 356-372, 374-444`（rev4 已实现遗忘）
+- **考察意图**：**这道题曾是前提错误题**（rev3 及以前无遗忘机制）。rev4 已实现遗忘，考的是能否讲清"为什么不能只靠时间衰减、必须引入时效标记"。
 - **答题要点**：
-  - **先纠正前提：本系统没有遗忘机制，因此不存在"衰减函数的选择"问题。** 证据链（可当场 grep）：
-    1. 首方代码检索 `遗忘|衰减|decay|forget|压缩|summar|rerank` —— 命中 0。
-    2. `user_memory.delete(memory_id)` 定义了（`user_memory.py:92-93`）但**没有任何调用者**；唯一的删除是 `clear()`（collection 级清空，`:95-102`），只被重置脚本与评测脚本使用。
-    3. `min_importance` 恒传 1（`memory_service.py:236`），而 `user_memory.py:52-54` 写成 `if min_importance > 1 else None` —— **等于永远不构造 `where` 过滤**，这个参数在当前调用方式下是死参数。
-    4. `importance` 只用于两处：排序（`:253`）和关键词 SQL 的 `ORDER BY`（`:207`）。它从不被降低、从不过期。
-    5. `last_accessed`（`:257-266`）只被写入，不参与任何淘汰判断。
-  - 结论表述：**记忆只增不减**，`tests/eval/memory_recall_cases.json` 的 `forgetting` 类 24 条用例断言"已过期/已被更正的信息不应被想起来"，**必然全部失败——这是产品缺口，不是测试写错**（`tests/eval/eval_memory.py:389-394` 的结论生成逻辑就是这么写的）。
-  - 然后**主动给设计方案**（这才是加分项）：① 时间衰减 `score *= exp(-λ·Δt_last_accessed)`，λ 按记忆类型取不同值（偏好类慢、事件类快）；② 写入时冲突覆盖——同主语同谓词的旧事实降权/标记 superseded（"以前住苏州"/"已搬南通"就是标准场景，评测集 `forget_001` 正是这条）；③ 容量上限 + LRU/importance 淘汰；④ 短期事实（天气、日程）不入长期库（当前靠 prompt 约束，见 Q39）。
-  - 反问面试官的收尾：衰减会导致"用户三个月前提过的喜好被判为不重要"，所以**更好的不是衰减而是分层**（core preferences / episodic facts），核心偏好永不衰减。
+  - **先说明旧前提已变**：rev3 无任何遗忘/衰减/覆盖；`user_memory.delete()` 定义后无调用者、`min_importance` 恒传 1 等于不过滤、`importance` 只用于排序——这些旧证据已成历史。
+  - **当前实现（三条路并行）**：
+    1. **时效标记软删除（主力）**：写入时 `_is_expired_fact` 命中过去时效词（`以前/之前/曾经/去年/上个月/上周/上周末/昨天/前天/过去`…）的事实，直接写 `status='expired'` 且**不进向量库**（软删除，SQLite 留痕）。覆盖"旧值已过去/已失效"。
+    2. **冲突覆盖**：新事实带"现状"标记（`已经/现在/换成/搬到/转岗/戒了/买好/决定不`…）且与同主体旧记忆共享关键词时，旧记忆置 `status='superseded'` 并调 `user_memory.delete()` 撤出向量库——`delete()` 终于有了调用者。
+    3. **时间衰减 × 访问频率**：`_recency_factor = exp(-λ·days) × (1+ln(1+access_count))`（λ=0.05/天），低于 `RECALL_MIN_RECENCY` 视为过期；召回时排除 `status!='active'`。
+  - **关键设计判断（加分点）**：为什么不能只靠时间衰减？因为**评测集的 120 条用例在同一瞬间写入**，`exp(-λ·Δt)=1` 对所有记忆成立，纯时间衰减在评测里**恒等无效**。真正能区分"过期事实"的信号是**文本里的时效标记**——这是"评测约束倒逼设计"的真实案例。
+  - 效果：遗忘类 0% → 91.7%（24 条里 22 条通过；剩 2 条是判定子串假阳性，见 Q20）。
+  - 诚实缺口：时效标记是**启发式**，可能误伤（如"我以前是军人，所以很自律"会被判过期）；没有把 TTL/λ 配置化；`status` 更新与 Chroma 删除仍是两步非事务操作。
 
 ### Q12｜同一轮里，人格、历史、记忆三份上下文的时间基准一致吗？meta 包内部呢？
 **锚点**：`main.py:167, 173, 198, 247-248, 212-213`
@@ -195,16 +199,26 @@
   - 顺带：仓库里并存两份库（`chroma_db/` 96 条 embedding vs `data/chroma_db/` 94 条），说明"相对路径 + 启动目录不同"已经真实产生过数据分叉（见 Q48）。
 
 ### Q20｜🔥 压力题｜RAG 的检索准确率是多少？怎么测的？
-**锚点**：`tests/eval/`、`logs/agent.log`、`main.py:132-135`
+**锚点**：`tests/eval/eval_report.md`、`tests/eval/eval_memory.py`、`logs/agent.log`
 - **考察意图**：经典"你有没有量化过效果"压力题。考的是**分层诚实的表达能力**，不是有没有数字。
 - **答题要点**：
   - **第一步：分开回答"RAG"和"记忆召回"，别混为一谈。**
-    - **角色设定 RAG（anime_kb）：没有任何量化评测。** 全仓无 RAG 评测脚本、无标注集、无 hit rate / MRR。已有的只是**运行日志观测**：`[RAG] 语义命中 N 条, tag命中 [...], tag补充 N 条, 最终注入 N 条`（`main.py:132-135, 141-144`）——这是"能看见"，不是"测过"。定性失败案例有两条实测（`logs/agent.log`）：`"我是ZZDW"` 召回"日文名/韩文名/英文名"（短查询向量稀释）；`"今天上海天气怎样？"` 仍注入 2 条身份设定。
-    - **用户记忆召回：已建评测，但真实数字还没跑出来。** 用例集 `tests/eval/memory_recall_cases.json`（120 条 = 5 类 × 24）+ 脚本 `tests/eval/eval_memory.py`（输出总/分类准确率、延迟分位、token、写 `eval_report.md`）。
-  - **第二步：明确标注当前报告的状态。** `tests/eval/eval_report.md` 目前是 **stub 后端自检版**（脚本自述：`--backend stub` 用字符 bigram 当替身，`eval_memory.py:433-435`；报告顶部有醒目警示）。**它里面那个"总准确率 52.5%"绝对不能引用**——那是替身检索的成绩，不代表系统能力；能证明的只是"评测流水线能跑通"。
-  - **第三步：给出复现命令与三层评测路线。** 真实结果一条命令：`HF_HUB_OFFLINE=1 venv/bin/python tests/eval/eval_memory.py`。评测体系分三层：① 单元契约测试（已闭环：`tests/test_response_contract.py` 4 用例，且用变异测试证明"退回修复点即变红"，见 `PROJECT_BRIEF.md` §9）；② 检索层评测（脚本就绪、待跑，覆盖 120 条）；③ LLM 端到端评测（缺 API 额度与环境，**未开始**）。
-  - **第四步（加分）：说清"能测什么"。** 已建的第二层刻意**只测检索层**（`store_memory`→`recall_memories`→排序截断），用例直接给结构化 fact，绕开 `extract_facts`（`memory_service.py:44-78` 要调 DeepSeek，且 120 条会放大成上千次调用）。**抽取质量仍是盲区**。
-  - 反面示范（会当场露馅）：编一个"准确率 85%"，或者把 stub 的 52.5% 说成真实结果，或者说"我们只用了 Chroma 官方评测"（本项目没有）。
+    - **角色设定 RAG（anime_kb）：没有任何量化评测。** 全仓无 RAG 评测脚本、无标注集、无 hit rate / MRR。已有的只是**运行日志观测**：`[RAG] 语义命中 N 条, tag命中 [...], 最终注入 N 条`——这是"能看见"，不是"测过"。
+    - **用户记忆召回：已有真实评测结果。** 用例集 `tests/eval/memory_recall_cases.json`（120 条 = 5 类 × 24）+ 脚本 `tests/eval/eval_memory.py`（输出总/分类准确率、延迟分位、token，写 `eval_report.md`）。
+  - **第二步：给出真实数字与 before/after。** `tests/eval/eval_report.md` 现为 **real 后端（ChromaDB + bge-small-zh-v1.5）真实结果**（旧 stub 版已废弃，其 52.5% 不可引用）。rev4 记忆重构前后：
+
+    | 类别 | 重构前 | 重构后 |
+    |---|---|---|
+    | 事实记忆 fact_recall | 100.0% | 100.0% |
+    | 多轮上下文 long_context | 100.0% | 100.0% |
+    | 情感记忆 emotion_memory | 100.0% | 100.0% |
+    | 干扰项 distractor | 4.2% | 100.0% |
+    | 遗忘验证 forgetting | 0.0% | 91.7% |
+    | **总准确率** | **60.8%** | **98.3%** |
+
+  - **第三步：给出复现命令与三层评测路线。** 真实结果一条命令：`HF_HUB_OFFLINE=1 venv/bin/python tests/eval/eval_memory.py`（加 `--trace` 会写逐用例明细到 `logs/eval_recall_trace_<时间>.log`）。评测体系分三层：① 单元契约测试（`tests/test_response_contract.py`）；② 检索层评测（已跑，120 条）；③ LLM 端到端评测（缺 API 额度与环境，**未开始**）。
+  - **第四步（加分）：主动说清剩余 2 条遗忘失败的真相。** 不是机制没生效，而是**判定是子串匹配的假阳性**：`forget_005` 的新事实"已经戒了可乐改喝奶茶"本身含"可乐"、`forget_008` 召回了闲聊"最近想学吉他"含"想学"，于是命中 `match_any` 被判失败——两条的**旧事实其实都已被正确过期**。这是"判定太粗"的已知局限，改进方向是否定词/主语感知的判定（会牺牲可重复性，需谨慎）。
+  - **反面示范（会当场露馅）**：编一个"准确率 85%"，或者把已废弃的 stub 52.5% 说成真实结果，或者说"我们只用了 Chroma 官方评测"（本项目没有）。
 
 ### Q21｜metadata 里的 `source` 字段有实际作用吗？
 **锚点**：`init_anime_kb.py:12`、`anime_kb.py:40-47`
@@ -287,13 +301,13 @@
   - 修法（按性价比排序）：① 人格状态改成**每次读 DB 并加行版本号**（`UPDATE ... WHERE version = ?`），冲突重试；② 记忆写入改为"SQLite 权威 + 后台补向量索引"，把跨进程状态收敛到单一数据库；③ 真要横向扩展就把 Chroma 换 Server 模式 / 换托管向量库；④ 在那之前**老实用 1 个 worker**，并在 README/部署文档里写明这个限制。
 
 ### Q29｜`momentum`（怒气惯性）的衰减逻辑有个边界 bug，在哪？
-**锚点**：`personality_state.py:138-150`
+**锚点**：`personality_state.py:138-162`（rev4 已修复）
 - **考察意图**：读分支语句的细致度（尤其是 `elif` 链的"跳过 else"效果）。
 - **答题要点**：
-  - 结构：`if affinity>30 and positive_count>=2 → happy, momentum=0` / `elif affinity<-20 → angry, momentum=max(m+1,3)` / `elif affinity<-10 → sad`（**不动 momentum**）/ `else → momentum=max(0,m-1)`，且只有 `momentum==0 且当前是 angry|sad` 才回落 `normal`。
-  - Bug：从 angry 掉进 **sad 分支（affinity 落在 (−20, −10)）时，momentum 既不清零也不递减**，而回落到 `normal` 的唯一路径在 `else` 分支里（`:148-150`）。所以心态是 "angry(3) → 好感度回到 −15 → sad" 时，`momentum` **永远停在 3**，情绪永久卡在 sad，直到 affinity 升过 −10 才会开始按轮递减。
-  - 反例边界：如果进入 sad 时 `momentum==0`（从未 angry 过），则升过 −10 后立刻回落 normal —— 所以这个卡死是**路径相关**的，只在"生气过 → 部分平复"的路径上出现，更隐蔽。
-  - 修法：`sad` 分支也递减 momentum（或统一在末尾做一次 momentum 处理），并把"情绪转移"抽成显式状态机转移表（(state, sentiment) → next_state, momentum_delta），不要靠 if/elif 顺序隐式表达。
+  - **旧 bug（rev3 及以前）**：分支是 `if affinity>30 and positive_count>=2 → happy, momentum=0` / `elif affinity<-20 → angry, momentum=max(m+1,3)` / `elif affinity<-10 → sad`（**不动 momentum**）/ `else → momentum=max(0,m-1)`，且只有 `momentum==0 且当前是 angry|sad` 才回落 `normal`。于是从 angry 掉进 **sad 分支（affinity 落在 (−20, −10)）时，momentum 既不清零也不递减**，而回落 `normal` 的唯一出口在 `else` 分支里——"angry(3) → 好感度回到 −15 → sad"后 `momentum` 永远停在 3，**情绪永久卡在 sad**，直到 affinity 升过 −10。路径相关，光看单轮逻辑看不出来。
+  - **rev4 修复**：`sad` 分支现在有惯性——首次进入 sad 时 `momentum = max(momentum, 2)`，之后每轮 `momentum -= 1`，减到 0 即回落 `normal`。即使 affinity 一直停留在 (−20, −10)，情绪也会在有限轮内自动恢复，死锁消除。
+  - 已加单测 `tests/test_personality.py::test_sad_momentum_decrements_to_normal` 锁定该行为。
+  - 残留可改进点：sad 到 0 回 normal 后，若 affinity 仍在负区，下一轮会再次进入 sad（表现为 sad↔normal 间歇，而非永久卡死）——要更平滑需引入"情绪事件时间线"或显式状态机转移表，而不是继续堆 if/elif。
 
 ### Q30｜为什么要两个计数器（`consecutive_positive` 和 `emotion_momentum`）？
 **锚点**：`personality_state.py:127-135, 138-150`
@@ -384,7 +398,7 @@
 **锚点**：`memory_service.py:46-55, 57-65`
 - **考察意图**：数据治理意识，以及"用 prompt 做治理"的边界。
 - **答题要点**：
-  - 动机：长期事实记忆与时效信息必须分开。不写这条约束，模型会把"今天上海 25 度""股市涨了"当用户事实存进永久库，一周后污染回复（而且系统**没有遗忘机制**，Q11 —— 存进去就再也出不来）。
+  - 动机：长期事实记忆与时效信息必须分开。不写这条约束，模型会把"今天上海 25 度""股市涨了"当用户事实存进永久库，一周后污染回复。rev4 虽已加入遗忘机制（时效标记软删除，见 Q11），但**天气/实时信息未必带"以前/上周"这类时效词**，仍必须靠这条 prompt 约束在写入侧拦掉——两层防护，不能只靠遗忘。
   - 其他约束也在同一个 prompt 里：最多 3 条、每条 ≤50 字（`:52`）、importance 由模型自评（喜好/雷点 8-10、闲聊 3-5，`:50`）、要求纯 JSON 且防 markdown 包裹（`:69-71` 三重 `removeprefix/removesuffix`）。
   - 局限：**全靠模型自觉**。没有 schema 校验（只判 `isinstance(facts, list)`，`:73-78`；解析失败直接返回 `[]`，静默丢一轮）、没有字段级校验（缺 `fact` 键会在 `main.py:208` 的 `f["fact"]` 处抛 KeyError → 非流式直接 500，见 Q35）、没有写入前的规则过滤。
   - **实测反例（很有说服力的素材）**：`logs/agent.log:47` 记录召回到 `fact=助手是蓝色头发，不是粉色` —— **"助手是自己"的属性被当成"关于用户的事实"存了下来**。说明 prompt 约束不足以控制抽取粒度，这也是 `tests/eval` 里 `extract_facts` 未被覆盖（Q20）的真正风险点。
@@ -498,9 +512,9 @@
 **锚点**：`tests/`、`main.py:28-50`、`logs/agent.log`
 - **考察意图**：工程成熟度自评——"你现在能证明什么、证明不了什么"。
 - **答题要点**：
-  - **测试现状**：共 **7 个用例**——`tests/test_chat.py` 3 个（GET/POST 正常 + 空消息 422，`:37-60`）、`tests/test_response_contract.py` 4 个（走工具/不走工具/流式 meta 形状/降级流带键，`:107-161`）。全部 mock、无副作用（不写库、不打外部 API、不烧额度）。运行必须带 `HF_HUB_OFFLINE=1`（否则 sentence-transformers 去 HuggingFace 拉模型元数据）。
-  - **测试有效性的证据**：对 4 个契约用例做过**变异测试**——把三处修复逐条退回，确认对应用例精确变红，并校验 `main.py` 完整复原（`PROJECT_BRIEF.md` §9）。这一步是回答"你的测试是不是摆设"的标准答案。
-  - **缺口（照实说）**：① **没有 CI**（全仓无 `.github/` / `.gitlab-ci.yml`，实测确认），测试全靠人手跑；② **没有真实 LLM 端到端测试**，7 个用例都是 mock 级——它们证明"字段被正确搬运和裁剪"，**不证明"真实 LLM 会正确触发工具"**；③ 无覆盖率统计与门槛；④ `extract_facts` / `_analyze_sentiment` 的**解析健壮性**（markdown 包裹、非法 JSON、字段缺失）没有一条测试——而 Q39 已证明抽取会出错。
+  - **测试现状**：共 **19 个用例**，分五组——`tests/test_chat.py` 3 个（GET/POST 正常 + 空消息 422）、`tests/test_response_contract.py` 4 个（走工具/不走工具/流式 meta 形状/降级流带键）、`tests/test_memory_owner.py` 5 个（主体推断 + 按主体过滤召回）、`tests/test_memory_forgetting.py` 4 个（时效软删除 / 冲突覆盖 / 召回排除过期，隔离到 tmp DB + 假向量库）、`tests/test_personality.py` 3 个（sad 死锁回归 / 怒气惯性 / happy 阈值）。全部 mock 或无外部副作用（不写生产库、不打外部 API、不烧额度）。运行必须带 `HF_HUB_OFFLINE=1`（否则 sentence-transformers 去 HuggingFace 拉模型元数据）。
+  - **测试有效性的证据**：对契约用例做过**变异测试**——把三处修复逐条退回，确认对应用例精确变红（`PROJECT_BRIEF.md` §9）；rev4 新增的记忆/人格用例均为"先构造缺陷态、再断言修复"的可回归测试。
+  - **缺口（照实说）**：① **没有 CI**（全仓无 `.github/` / `.gitlab-ci.yml`，测试全靠人手跑）；② **没有真实 LLM 端到端测试**，19 个用例都是 mock 级——它们证明"字段搬运/检索排序/状态机转移正确"，**不证明"真实 LLM 会正确触发工具或抽对事实"**；③ 无覆盖率统计与门槛；④ `extract_facts` / `_analyze_sentiment` 的**解析健壮性**（markdown 包裹、非法 JSON、字段缺失）仍没有一条测试。
   - **可观测性现状**：只有 logging —— 控制台 INFO（`main.py:36-41`）+ `logs/agent.log` DEBUG（`:45-50`），`httpcore/httpx/openai` 噪音被压到 WARNING（`:32-33`，这个细节做得好）。业务关键事件确实有打点：`[RAG] 语义命中/tag命中/注入片段`、`[ReAct] Thoughts/Actions/Tool`、`[UserMemory] 召回 + distance`、`[人格] 情绪/好感度/动量`。**本项目所有"实测证据"都来自 grep 这个日志文件**——说明日志设计是有效的。
   - **最关键的缺口一句话**：**只有分子，没有分母。** 现在能 grep 出"某次格式异常""某次召回了 2 条"，但拿不到"总请求数""命中率""工具调用失败率""格式异常率"——因为没有 metrics、没有计数聚合。补法很轻：把上述日志事件做成计数器（Prometheus counter 或定期聚合写日志），就能在不改架构的前提下拿到所有关键比率。
 
@@ -510,11 +524,11 @@
 
 | # | 题号 | 一句话靶子 | 正确答法的关键动作 |
 |---|---|---|---|
-| 1 | **Q4** | `1=1` 兜底会把"无关键词"的 query 变成"返回全表最重要的 3 条" | 指出这条静默路径 + 触发门槛极低（停用词表） |
-| 2 | **Q7** | 合并后按 importance 硬排，把相关性序（distance）丢掉 | 说清"采集了信号却不用" + 给融合打分方案 |
-| 3 | **Q11** | "遗忘机制的衰减函数为什么这么选" | **纠正前提：没有遗忘机制**，给完整 grep 证据链，再给设计方案 |
+| 1 | **Q4** | `1=1` 兜底会把"无关键词"的 query 变成"返回全表最重要的 3 条" | **rev4 已删除该兜底**；讲清旧路径的隐蔽性 + 当前 `if not keywords: return []` |
+| 2 | **Q7** | 合并后按 importance 硬排，把相关性序（distance）丢掉 | **rev4 已改为 distance 融合重排 + 双重阈值**；讲清旧缺陷与现方案，附 before/after |
+| 3 | **Q11** | "遗忘机制的衰减函数为什么这么选" | **rev4 已实现遗忘**（时效标记软删除 + 冲突覆盖 + 衰减×频率）；点明"评测同时间戳→纯时间衰减无效、必须用时效标记" |
 | 4 | **Q16** | `t in msg` 子串匹配 tag，会踩什么坑 | 举知识库单字 tag `"女"` 的实例 + 日志实录 |
-| 5 | **Q20** | "检索准确率多少、怎么测的" | 分三层回答：契约测试已闭环 / 检索层脚本就绪待跑 / 端到端未开始；**绝不引用 stub 的 52.5%** |
+| 5 | **Q20** | "检索准确率多少、怎么测的" | 分三层回答：契约测试已闭环 / 检索层已跑（60.8%→98.3%）/ 端到端未开始；**绝不引用已废弃的 stub 52.5%** |
 | 6 | **Q25** | "好感度的衰减" | **纠正前提：无时间衰减**，momentum 是轮次不是时间；指出 README 过度声明 |
 | 7 | **Q28** | 加 `--workers 2` 会怎样 | 全局单例 + 无锁整行覆盖 → 状态分叉；Chroma 多进程锁竞争 |
 | 8 | **Q35** | 持久化/抽取失败时用户看到什么 | 非流式 500 丢回复（回复已生成）vs 流式静默跳过后续步骤 |
