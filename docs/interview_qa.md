@@ -1,7 +1,7 @@
 # 希格雯桌宠 — 面试深挖题库（50 题）
 
 > 定位：以"资深 AI 应用工程师面试官"视角，针对本仓库真实实现出题。
-> 锚点基准：**rev4**（2026-09-24，记忆系统重构 + 人格死锁修复）。`main.py` = 316 行、`memory_service.py` = 459 行、`agent.py` = 273 行、`personality_state.py` = 166 行、`schemas.py` = 21 行、`retrievers/user_memory.py` = 128 行、`retrievers/anime_kb.py` = 70 行、`init_anime_kb.py` = 845 行（92 条文档）。
+> 锚点基准：**rev4 + `eca5139`**（2026-09-24：记忆系统重构 + 人格死锁修复 + `eca5139` 两处缺陷修复）。`main.py` = 316 行、`memory_service.py` = 516 行、`agent.py` = 273 行、`personality_state.py` = 166 行、`schemas.py` = 21 行、`retrievers/user_memory.py` = 132 行、`retrievers/anime_kb.py` = 70 行、`init_anime_kb.py` = 845 行（92 条文档）。
 > 代码改动后行号会漂，重算方法见 `PROJECT_BRIEF.md` §9。
 > 🔥 = 压力题，共 **10** 个（索引见文末）。压力题的共同特征：**答"有"就露馅，正确答法通常是先纠正题目前提**。
 > 所有"实测"均可在 `logs/agent.log`（1432 行，2026-09-24 快照）与 `chroma_db/`、`chat.db` 里复核。
@@ -29,24 +29,24 @@
   - `messages` 表无 `session_id`、无清理、永久堆积（`schemas.py:7` 的 `session_id` 收下即丢）。
 
 ### Q2｜长期记忆为什么要 SQLite + Chroma 双写？两边各存什么？
-**锚点**：`memory_service.py:178-237`、`retrievers/user_memory.py:27-49`
+**锚点**：`memory_service.py:189-248`、`retrievers/user_memory.py:27-49`
 - **考察意图**：向量库与关系库的职责边界，以及双写一致性的代价意识。
 - **答题要点**：
   - SQLite `memories` 是**权威源**：`fact/keywords/importance/owner/status/access_count/created_at/last_accessed`（`memory_service.py:31-43`），带去重、去排序、供关键词 LIKE 检索。`owner`（主人/他人）、`status`（active/superseded/expired）、`access_count` 是 rev4 记忆重构新增的列，旧库通过 `PRAGMA table_info` + `ALTER TABLE` 幂等迁移补列。
   - Chroma `user_memories` 是**派生的向量索引**：只存 `documents=[fact]` + metadata（含 `owner`，`user_memory.py:37-50`），用于语义召回。
-  - 顺序是"先 SQLite 拿 `lastrowid`（`:214`）→ 再用 `str(memory_id)` 写 Chroma"，id 是两边的唯一关联键。这也解释了召回侧为什么要 `str(r.get("id"))` 统一类型：向量路 id 是 str、关键词路是 int。
+  - 顺序是"先 SQLite 拿 `lastrowid`（`:225`）→ 再用 `str(memory_id)` 写 Chroma"，id 是两边的唯一关联键。这也解释了召回侧为什么要 `str(r.get("id"))` 统一类型：向量路 id 是 str、关键词路是 int。
   - 代价：Chroma 写失败只 `logger.error` 不补偿，两边可能长期漂移；没有事务、没有对账任务。rev4 的"冲突覆盖/时效软删除"会**同时**改 SQLite `status` 并 `user_memory.delete()` 撤出向量，但仍是两步非事务操作。
 
 ### Q3｜写入去重为什么用"全表逐行比对"？这样写有什么问题？
-**锚点**：`memory_service.py:96-98, 193-198`
+**锚点**：`memory_service.py:96-98, 204-209`
 - **考察意图**：是否看得见 O(n) 与原子性。
 - **答题要点**：
   - `_normalize_fact` 只剥末尾标点（`rstrip("。！？，,.!?;；:： \t\n")`），解决"喝奶茶。"≠"喝奶茶"，但归一化规则是**应用层**的，无法用 `UNIQUE(fact)` 约束表达。
-  - 于是退化成 `SELECT id, fact FROM memories` 全表扫描 + Python 侧逐行比较（`:193-198`）——每写一条 O(n)（实测 `chat.db` 里仅 4 条记忆，量级压力未暴露）。
+  - 于是退化成 `SELECT id, fact FROM memories` 全表扫描 + Python 侧逐行比较（`:204-209`）——每写一条 O(n)（实测 `chat.db` 里仅 4 条记忆，量级压力未暴露）。
   - 更硬的缺陷：**check-then-act 非原子**。并发两次相同写入都可能通过检查再各插一行（无唯一索引兜底）。正解是加 `normalized_fact` 列 + `UNIQUE` 索引，或 `INSERT ... ON CONFLICT DO NOTHING`，把归一化下沉到写入路径。
 
 ### Q4｜🔥 压力题｜`_recall_by_keywords` 里的 `1=1` 兜底是什么？什么时候走到？后果多严重？
-**锚点**：`memory_service.py:299-320`（rev4 已修复）
+**锚点**：`memory_service.py:310-331`（rev4 已修复）
 - **考察意图**：能不能发现/讲清这条"看起来有召回、实际无相关性"的隐蔽路径——它曾是本系统最脏的一段代码。
 - **答题要点**：
   - **先纠正前提（若被问"现在还有没有"）**：rev4 记忆重构已删除该兜底。旧实现：query 分词 → 过滤停用词/长度/纯符号 → **若 `keywords` 为空，则 `conditions = "1=1"`**，f-string 拼进 SQL 后成为 `WHERE 1=1 ORDER BY importance DESC, last_accessed DESC LIMIT 3`，**返回整表"最重要+最近访问"的 3 条**，与 query 完全无关。
@@ -55,26 +55,26 @@
   - 可延伸：关键词路仍按 `ORDER BY importance` 排序（未做独立相关性重排），但它现在是**兜底**且结果会并入 `recall_memories` 的融合重排，所以"importance 当相关性"的残留问题只影响兜底路。
 
 ### Q5｜向量路和关键词路为什么用 id 去重而不是文本去重？哪一路优先？
-**锚点**：`memory_service.py:401-411`、`retrievers/user_memory.py:78-90`
+**锚点**：`memory_service.py:455-468`、`retrievers/user_memory.py:78-90`
 - **考察意图**：对"同一实体两路命中"的理解，以及"优先"这个词在融合打分下还剩多少意义。
 - **答题要点**：
-  - 同一条记忆天然会被两路同时召回（Chroma 的 id 就是 SQLite 主键的字符串形式），文本可能有细微差异（Chroma 侧存归一化后的 fact），所以必须靠 **id 判等**；`str()` 转换是为了抹平"向量路 str / 关键词路 int"的类型差（`:405`）。
-  - 顺序 `for r in vec_results + kw_results`（`:404`）→ 向量结果先入 `merged`，`seen` 只是防重，所以"向量优先"在**合并阶段**体现为插入顺序。
-  - **但"优先"的语义在 rev4 变了**：rev3 是合并后 `sort(key=importance)` 把顺序彻底重排，向量相关性序被丢掉；rev4 改为按 `score = 0.9*(1-distance) + 0.1*(importance/10)` 融合排序（`:425-434`），`distance` 第一次真正参与决策——插入顺序只在**打分完全打平时**才起 tie-break 作用。
-  - 合并之后紧接着两步过滤，共同决定"哪一路的候选能活到打分"：**主体过滤**（`:410-411`，`owner` 与提问主体不一致的直接剔除）与**遗忘过滤**（`:417-423`，衰减过度的丢弃）。
-  - 可延伸的诚实点：关键词路的 SQL 不返回 `distance`，`_score` 给它 `0.4*importance/10` 的弱分（`:429`）——关键词路候选在融合打分里**天然吃亏**，与"向量优先"的意图一致，但代价是"专名精确命中"也可能被压掉。
+  - 同一条记忆天然会被两路同时召回（Chroma 的 id 就是 SQLite 主键的字符串形式），文本可能有细微差异（Chroma 侧存归一化后的 fact），所以必须靠 **id 判等**；`str()` 转换是为了抹平"向量路 str / 关键词路 int"的类型差（`:459`）。
+  - 顺序 `for r in vec_results + kw_results`（`:458`）→ 向量结果先入 `merged`，`seen` 只是防重，所以"向量优先"在**合并阶段**体现为插入顺序。
+  - **但"优先"的语义在 rev4 变了**：rev3 是合并后 `sort(key=importance)` 把顺序彻底重排，向量相关性序被丢掉；rev4 改为按 `score = 0.9*(1-distance) + 0.1*(importance/10)` 融合排序（`:482-491`），`distance` 第一次真正参与决策——插入顺序只在**打分完全打平时**才起 tie-break 作用。
+  - 合并之后紧接着两步过滤，共同决定"哪一路的候选能活到打分"：**主体过滤**（`:467-468`，`owner` 与提问主体不一致的直接剔除）与**遗忘过滤**（`:474-480`，衰减过度的丢弃）。
+  - 可延伸的诚实点：关键词路的 SQL 不返回 `distance`，`_score` 给它 `0.4*importance/10` 的弱分（`:486`）——关键词路候选在融合打分里**天然吃亏**，与"向量优先"的意图一致，但代价是"专名精确命中"也可能被压掉。
 
 ### Q6｜为什么要跑两路召回？各自补了什么短板？
-**锚点**：`memory_service.py:374-399`、`data/logs/agent.log:1-8`
+**锚点**：`memory_service.py:428-453`、`data/logs/agent.log:1-8`
 - **考察意图**：检索架构的设计动机。
 - **答题要点**：
-  - 语义路（`user_memory_rag.recall`，`:389`）解决同义表达："我平时喝什么饮料"→"主人喜欢喝奶茶"。
-  - 关键词路（`_recall_by_keywords`，`:399`）解决专名/精确词——bge-small-zh 是 512 维小模型，对极短 query 和生僻专名召回弱（日志实证：`"我是ZZDW"` 召回出"日文名/韩文名/英文名"三条，语义路被短查询稀释）。
-  - 成本：每轮一次 embedding 编码（CPU 上 ms~百 ms 级）+ 一次全表 `LIKE` 扫描 ×N 个关键词（`:312-315` 把每个词展开成两个 LIKE 条件）。
-  - 可质疑点：两路都只取 top3、合并最多 6 条再截 3（`:389,399,443`），**候选池太小**，没有给重排留空间。
+  - 语义路（`user_memory_rag.recall`，`:443`）解决同义表达："我平时喝什么饮料"→"主人喜欢喝奶茶"。
+  - 关键词路（`_recall_by_keywords`，`:453`）解决专名/精确词——bge-small-zh 是 512 维小模型，对极短 query 和生僻专名召回弱（日志实证：`"我是ZZDW"` 召回出"日文名/韩文名/英文名"三条，语义路被短查询稀释）。
+  - 成本：每轮一次 embedding 编码（CPU 上 ms~百 ms 级）+ 一次全表 `LIKE` 扫描 ×N 个关键词（`:323-326` 把每个词展开成两个 LIKE 条件）。
+  - 可质疑点：两路都只取 top3、合并最多 6 条再截 3（`:443,453,500`），**候选池太小**，没有给重排留空间。
 
 ### Q7｜🔥 压力题｜合并后按 `importance` 硬排，为什么这是本系统最核心的检索缺陷？
-**锚点**：`memory_service.py:374-444`（rev4 已修复）
+**锚点**：`memory_service.py:428-501`（rev4 已修复）
 - **考察意图**：能否指出"采集了相关性指标却不用它做决策"这一典型失误。
 - **答题要点**：
   - **先纠正前提（若被问"现在还是不是"）**：rev4 已改为 distance 为主的融合重排。旧实现是 `merged.sort(key=importance, reverse=True)` 后 `[:top_k]`——`importance` 是写入时 LLM 自评的重要性，与"这条记忆和本轮问题有多相关"完全无关；一条 `importance=9` 的无关记忆会挤掉 `importance=6` 的真正命中项。而 `user_memory.recall` 明明把 `distances` 取出来了，却从不参与任何决策。
@@ -87,11 +87,11 @@
   - 可质疑点（诚实说）：相对阈值 + 单候选倾向会让"平均召回条数"下降，是**用 recall 换 precision**；权重与阈值是经验值，缺数据支撑，记忆规模上去后要重调；`importance` 仍以 0.1 的权重参与，并非完全移除。
 
 ### Q8｜`store_memory` 里 SQLite 与 Chroma 的写入顺序能反过来吗？
-**锚点**：`memory_service.py:178-237`
+**锚点**：`memory_service.py:189-248`
 - **考察意图**：一致性设计的推理能力。
 - **答题要点**：
-  - 不能轻易反。当前顺序的前提是"SQLite 自增主键作为两库关联键"：先 `INSERT` 拿 `lastrowid`（`:214`），才能用它当 Chroma 的 `ids`（`:226-232`）。
-  - 反过来做，要么自己生成 UUID 与 SQLite 主键脱钩（召回时 `update_accessed(m["id"])` 就得用 UUID 反查，`main.py:180`→`memory_service.py:446-455` 全链路要改），要么在 Chroma 失败时回滚 SQLite（当前无事务）。
+  - 不能轻易反。当前顺序的前提是"SQLite 自增主键作为两库关联键"：先 `INSERT` 拿 `lastrowid`（`:225`），才能用它当 Chroma 的 `ids`（`:237-243`）。
+  - 反过来做，要么自己生成 UUID 与 SQLite 主键脱钩（召回时 `update_accessed(m["id"])` 就得用 UUID 反查，`main.py:180`→`memory_service.py:503-512` 全链路要改），要么在 Chroma 失败时回滚 SQLite（当前无事务）。
   - 现顺序的残留风险：SQLite 成功、Chroma 失败 → 记忆**只能被关键词路召回**，语义路永远看不到；无对账、无重试。可提出的方案：把双写做成"先写 SQLite 并标记 `indexed=0`，后台任务补索引"（变同步双写为最终一致）。
 
 ### Q9｜记忆注入的那句强指令有什么设计意图？有什么风险？
@@ -103,7 +103,7 @@
   - 没有"本轮无可用记忆"的显式信号，也没有让模型自评"这些记忆跟问题有关吗"的机会。改进：给每条记忆附 `distance`/重要性，让模型自行取舍；或干脆把指令弱化成"以下是一些可能相关的背景"。
 
 ### Q10｜召回后 `update_accessed` 到底起什么作用？它在排序里有隐性影响吗？
-**锚点**：`main.py:179-180`、`memory_service.py:446-456, 356-372`
+**锚点**：`main.py:179-180`、`memory_service.py:503-513, 367-383`
 - **考察意图**：是否愿意追一个小字段的真实影响力，而不是当它"没用"。
 - **答题要点**：
   - 写入：每轮对**进入 Prompt 的每条记忆**逐条 `update_accessed`（`main.py:180`），无批量、无节流，N 条记忆就是 N 次 SQLite 连接开关。rev4 起它**同时累加 `access_count`**：`UPDATE memories SET last_accessed=?, access_count=COALESCE(access_count,0)+1`。
@@ -113,7 +113,7 @@
   - 对比 rev3：那时 `last_accessed` 只写不参与淘汰，净效果仅是"同分时热点优先"；rev4 才第一次把它接进遗忘决策。
 
 ### Q11｜🔥 压力题｜遗忘机制里的衰减函数为什么这么选？
-**锚点**：`memory_service.py:96-176, 356-372, 374-444`（rev4 已实现遗忘）
+**锚点**：`memory_service.py:96-187, 367-383, 428-501`（rev4 已实现遗忘）
 - **考察意图**：**这道题曾是前提错误题**（rev3 及以前无遗忘机制）。rev4 已实现遗忘，考的是能否讲清"为什么不能只靠时间衰减、必须引入时效标记"。
 - **答题要点**：
   - **先说明旧前提已变**：rev3 无任何遗忘/衰减/覆盖；`user_memory.delete()` 定义后无调用者、`min_importance` 恒传 1 等于不过滤、`importance` 只用于排序——这些旧证据已成历史。
@@ -295,10 +295,10 @@
 **锚点**：`main.py:59, 64, 67, 114, 316`、`personality_state.py:52-71`
 - **考察意图**：全局可变状态 + 无锁 + 单进程假设的连锁后果。这是"作品集会崩在哪"的典型问题。
 - **答题要点**：
-  - 事实基础：服务里有一堆**模块级单例**——`personality`（`main.py:59`）、`anime_rag`（`:64`）、`async_llm_client`（`:67`）、`agent`（`:114`）、以及 `memory_service.user_memory_rag`（`memory_service.py:17`）。uvicorn 是单进程启动（`main.py:316` 的 `uvicorn.run(app, ...)`，**没有 workers 参数**），所以现在没问题。
+  - 事实基础：服务里有一堆**模块级单例**——`personality`（`main.py:59`）、`anime_rag`（`:64`）、`async_llm_client`（`:67`）、`agent`（`:114`）、以及 `memory_service.user_memory_rag`（`memory_service.py:18`）。uvicorn 是单进程启动（`main.py:316` 的 `uvicorn.run(app, ...)`，**没有 workers 参数**），所以现在没问题。
   - 一旦多 worker / 多实例：
     1. **人格状态分叉（最严重）**：每个 worker 各持一份内存状态（`PersonalityState._load()` 只在 `__init__` 时读一次，`:36`），`update()` 改内存后整行覆盖写（`:56-71`）——**没有版本号、没有乐观锁、没有合并**。两个 worker 交替处理时，`A` 写的 affinity 会被 `B` 用陈旧内存值覆盖 → 丢更新、情绪跳变。
-    2. **Chroma 并发写**：PersistentClient 走本地 SQLite，多进程写会锁竞争（实测：只读快照都遇到过 `database is locked`）。`store_memory` 只在写 Chroma 处 try/except（`memory_service.py:116-124`），失败静默 → **记忆静默丢失**。
+    2. **Chroma 并发写**：PersistentClient 走本地 SQLite，多进程写会锁竞争（实测：只读快照都遇到过 `database is locked`）。`store_memory` 只在写 Chroma 处 try/except（`memory_service.py:236-245`），失败静默 → **记忆静默丢失**。
     3. 记忆去重 check-then-act 非原子（Q3）→ 重复记忆概率上升。
   - 修法（按性价比排序）：① 人格状态改成**每次读 DB 并加行版本号**（`UPDATE ... WHERE version = ?`），冲突重试；② 记忆写入改为"SQLite 权威 + 后台补向量索引"，把跨进程状态收敛到单一数据库；③ 真要横向扩展就把 Chroma 换 Server 模式 / 换托管向量库；④ 在那之前**老实用 1 个 worker**，并在 README/部署文档里写明这个限制。
 
@@ -361,20 +361,20 @@
 **锚点**：`main.py:190-216`（非流式）vs `:219-234, 255`（流式）
 - **考察意图**：副作用与响应链路的耦合分析——把"看起来一样的两条路径"拆成两种故障行为。
 - **答题要点**：
-  - **非流式 `/chat`：用户会丢掉已经生成好的回复。** `_handle_chat` 把 `personality.update(msg)`（`:198`）、`save_message`（`:201-202`）、`extract_facts`（`:206`）、`store_memory`（`:207-208`）**全部同步执行**，而 `chat_post` 的 `try` 把 `_handle_chat` 整个包住（`:263-275`）→ 任何一步抛异常都变成 500。注意 `extract_facts` 和 `_analyze_sentiment` 内部的 `client.chat.completions.create` **没有 try**（`memory_service.py:57-65`、`personality_state.py:81-89`）→ **DeepSeek 抖一次，整个请求 500，回复白生成**。这是最反直觉的耦合。
+  - **非流式 `/chat`：用户会丢掉已经生成好的回复。** `_handle_chat` 把 `personality.update(msg)`（`:198`）、`save_message`（`:201-202`）、`extract_facts`（`:206`）、`store_memory`（`:207-208`）**全部同步执行**，而 `chat_post` 的 `try` 把 `_handle_chat` 整个包住（`:263-275`）→ 任何一步抛异常都变成 500。注意 `extract_facts` 和 `_analyze_sentiment` 内部的 `client.chat.completions.create` **没有 try**（`memory_service.py:72-80`、`personality_state.py:81-89`）→ **DeepSeek 抖一次，整个请求 500，回复白生成**。这是最反直觉的耦合。
   - **流式 `/chat/stream`：用户不受影响，但后续步骤会被静默跳过。** `_persist_chat` 由 `background_tasks.add_task` 注册（`:255`），在响应流结束后执行，异常不影响已发送的流（**设计上更正确**）。但 `_persist_chat`（`:219-234`）**没有 try/except** → `save_message` 失败则消息不存、`extract_facts` 失败则人格永不更新（`:234` 被跳过），只有 Starlette 的默认日志留痕。
   - 顺序脆弱点：非流式是 `save_message → extract_facts → store_memory → personality.update`（`:198-208`），**人格更新在最后**；流式是 `存消息 → 抽取 → 存记忆 → 更新人格`（`:224-234`）——两者顺序还不一样（非流式先更新人格再存消息），行为差异没有文档说明。
   - **另一个容易忽略的细节**：`background_tasks.add_task(_persist_chat, msg, full_reply_parts)` 传的是**可变列表的引用**（`:241,255`），闭包在流结束时读它的最终内容 —— 这是它能工作的原因，也意味着一旦有人改成"先 copy 再传"就会存下空回复。这种隐式契约值得写注释。
   - 修法与答辩口径：① 副作用全部移出响应关键路径（流式已经对了，非流式应该改成 BackgroundTasks）；② `_persist_chat` 内部逐步 try + 结构化日志（哪一步失败、丢了多少数据）；③ 用户侧不因持久化失败而拿不到回复。
 
 ### Q36｜为什么有两个（实际是三个）OpenAI 客户端？硬编码了哪些东西？
-**锚点**：`main.py:8, 13, 67-69`、`memory_service.py:19-21`、`test_api.py:10-13`
+**锚点**：`main.py:8, 13, 67-69`、`memory_service.py:20-22`、`test_api.py:10-13`
 - **考察意图**：配置收敛与重复度意识。
 - **答题要点**：
-  - 事实：全仓构造了 **3 个客户端实例**——`test_api.client`（同步，`test_api.py:10-13`）、`memory_service.client`（同步，`memory_service.py:19-21`）、`main.async_llm_client`（异步，`main.py:67-69`）。`main.py:13` 只是把 `test_api.client` 重命名导入成 `llm_client`，不是新建。`personality_state.py:7` 直接复用 `memory_service.client`，所以"一次 patch 就能 mock 掉情绪+事实两处 LLM"（这正是 `tests/test_response_contract.py:95-100` 的做法）。
+  - 事实：全仓构造了 **3 个客户端实例**——`test_api.client`（同步，`test_api.py:10-13`）、`memory_service.client`（同步，`memory_service.py:20-22`）、`main.async_llm_client`（异步，`main.py:67-69`）。`main.py:13` 只是把 `test_api.client` 重命名导入成 `llm_client`，不是新建。`personality_state.py:7` 直接复用 `memory_service.client`，所以"一次 patch 就能 mock 掉情绪+事实两处 LLM"（这正是 `tests/test_response_contract.py:95-100` 的做法）。
   - 为什么必须有一个异步的：流式要用 `async for chunk in response`（`main.py:104`），同步 `OpenAI` 不支持；所以 `AsyncOpenAI` 不可省。
-  - 重复度问题：`model="deepseek-v4-pro"` 写死 **5 处**（`main.py:77,95`；`memory_service.py:58`；`personality_state.py:82`）、`temperature` 4 处（`0.7/0.7/0.3/0.3`）、`max_tokens` 4 处（`800/800/1500/100`）。改模型要改 5 个地方，且没有配置项。
-  - 一个真实的启动风险：三个客户端都是**模块导入时构造**（`main.py:67`、`memory_service.py:19`、`test_api.py:10`），而 `main.py:10-15` 导入 `test_api`、`test_api.py:8` 又导入 `memory_service` → 导入 `main` 就会连锁构造。若 `DEEPSEEK_API_KEY` 缺失且环境里没有 `OPENAI_API_KEY`，openai SDK 在**构造时**就抛 `OpenAIError` → **服务根本起不来**（不是运行时 401）。这种"缺配置"应该给一条明确的启动期报错信息，而不是 SDK 的通用异常栈。
+  - 重复度问题：`model="deepseek-v4-pro"` 写死 **5 处**（`main.py:77,95`；`memory_service.py:73`；`personality_state.py:82`）、`temperature` 4 处（`0.7/0.7/0.3/0.3`）、`max_tokens` 4 处（`800/800/1500/100`）。改模型要改 5 个地方，且没有配置项。
+  - 一个真实的启动风险：三个客户端都是**模块导入时构造**（`main.py:67`、`memory_service.py:20`、`test_api.py:10`），而 `main.py:10-15` 导入 `test_api`、`test_api.py:8` 又导入 `memory_service` → 导入 `main` 就会连锁构造。若 `DEEPSEEK_API_KEY` 缺失且环境里没有 `OPENAI_API_KEY`，openai SDK 在**构造时**就抛 `OpenAIError` → **服务根本起不来**（不是运行时 401）。这种"缺配置"应该给一条明确的启动期报错信息，而不是 SDK 的通用异常栈。
   - 正解：抽 `llm.py` 暴露 `SYNC_CLIENT` / `ASYNC_CLIENT` + `MODEL` / `TIMEOUT` 常量，全部从环境变量读。
 
 ### Q37｜工具为什么"失败也要返回文案"？这个选择的副作用是什么？
@@ -416,7 +416,7 @@
   | "混合 RAG…解决向量稀释问题"（`:114`） | **部分成立，措辞过度** | tag 补充召回确实存在（`main.py:125-128`）；但 tag 是知识库自述词 + 子串匹配，1432 行日志里带 tag 判定的 67 条中非"无"仅 12 条（17.9%，且 11 条是单字 tag `女`；Q15/Q16），"解决"言过其实 |
   | "人格状态机：情绪/好感度动态衰减"（`:116`） | **不成立** | 无时间衰减、无回归、无 TTL（Q25）；只有轮次惯性 momentum |
   | "前端 .NET 10 WPF + Prism + MVVM"（`:107`） | **不在本仓库** | 全仓 `*.csproj` / `*.cs` / `*.xaml` 命中 0；README:13-15 已说明是另一个仓库（MyAIPet） |
-  | "双层记忆系统"（`:113`） | **成立** | SQLite `messages` + `memories`/Chroma（`test_api.py:18-25`、`memory_service.py:30-39`） |
+  | "双层记忆系统"（`:113`） | **成立** | SQLite `messages` + `memories`/Chroma（`test_api.py:18-25`、`memory_service.py:31-43`） |
   | "NDJSON 流式，meta 前置"（`:108`） | **成立** | `main.py:243-252`；注意 meta 的时序语义见 Q12 |
   - 答辩口径：**"README 里有两处过度声明（衰减、解决向量稀释），我在自己的项目档案里已经逐条标注了事实与证据"** —— 这种自我审计能力本身就是强信号。最好顺手把 README 改准（改文案成本为零、收益明显）。
 
@@ -484,15 +484,15 @@
   - **鉴权：无。** 三个接口全部匿名可调（`main.py:260-310`），没有 `Depends` 校验、没有 API Key、没有 `add_middleware`（可 grep：全仓 `CORSMiddleware|add_middleware|Depends` 命中 0）。
   - **限流：无。** 单次请求会触发 **1~6 次 DeepSeek 调用**（规划 ≤3 + 生成 1 + 情绪 1 + 抽取 1，`agent.py:15`、`main.py:198,206`、`personality_state.py:124`）。一个循环脚本就能烧光额度。输入侧只有 `msg` 的 `min_length=1, max_length=2000`（`schemas.py:6`），**没有频率/并发/每日配额限制**。
   - **CORS：未配置。** WPF 桌面客户端不受同源策略约束，所以没暴露问题；但任何网页 demo 都会被拦。
-  - **Key 管理：可用但不完善。** 三个 Key 从环境变量读（`.env.example` 四键：DEEPSEEK / HEFENG_KEY / HEFENG_HOST / BOCHA），compose 用 `env_file: .env`（`docker-compose.yml:7`），`.env` 未被跟踪（`.gitignore:8`）——这部分做得对。可挑的点：Key 在模块导入时被读取并构造客户端（`main.py:67`、`memory_service.py:19`），**缺失即启动失败**（Q36）；没有任何启动期校验给出友好提示。
+  - **Key 管理：可用但不完善。** 三个 Key 从环境变量读（`.env.example` 四键：DEEPSEEK / HEFENG_KEY / HEFENG_HOST / BOCHA），compose 用 `env_file: .env`（`docker-compose.yml:7`），`.env` 未被跟踪（`.gitignore:8`）——这部分做得对。可挑的点：Key 在模块导入时被读取并构造客户端（`main.py:67`、`memory_service.py:20`），**缺失即启动失败**（Q36）；没有任何启动期校验给出友好提示。
   - **结论口径**：**"当前定位是单机/局域网自用，不能直接对外。最小改造顺序是：鉴权中间件 → 按用户令牌桶限流 + 每日配额 → LLM 调用级 timeout → 请求 ID + 日志轮转。"** 把顺序说清楚，比说"我们上线时会加安全" 强得多。
   - 补充一个细节（体现你真的翻过仓库）：`.gitignore:14` 和 `.dockerignore` 末尾都是 `.workbuddy/`，规则与实际目录一致（早期版本曾写成不带点的 `workbuddy/` 而失效，当前已正确）；而 `.dockerignore` 排除了 `chroma_db` / `chat.db` / `data/`，所以镜像内不带数据，全靠 compose 的挂载点提供 —— 这与 Q43 的哨兵判断强耦合。
 
 ### Q48｜数据落在哪？为什么仓库里会有两份向量库？有备份吗？
-**锚点**：`memory_service.py:23`、`retrievers/user_memory.py:16`、`docker-compose.yml:8-11`、`reset_db.py`
+**锚点**：`memory_service.py:24`、`retrievers/user_memory.py:16`、`docker-compose.yml:8-11`、`reset_db.py`
 - **考察意图**：路径假设与数据安全意识。
 - **答题要点**：
-  - 落点：**相对路径**。`DB_PATH = "chat.db"`（`memory_service.py:23`）、`UserMemoryRAG(db_path="./chroma_db")`（`user_memory.py:16`）、`AnimeRAG(db_path="./chroma_db")`（`anime_kb.py:11`）、日志 `logs/agent.log`（`main.py:45`）——全部相对**当前工作目录**。Docker 里靠 `WORKDIR /app`（`Dockerfile:6`）与 entrypoint 的 `cd /app`（`entrypoint.sh:3`）兜住。
+  - 落点：**相对路径**。`DB_PATH = "chat.db"`（`memory_service.py:24`）、`UserMemoryRAG(db_path="./chroma_db")`（`user_memory.py:16`）、`AnimeRAG(db_path="./chroma_db")`（`anime_kb.py:11`）、日志 `logs/agent.log`（`main.py:45`）——全部相对**当前工作目录**。Docker 里靠 `WORKDIR /app`（`Dockerfile:6`）与 entrypoint 的 `cd /app`（`entrypoint.sh:3`）兜住。
   - **两份库的成因**：从仓库根目录跑 → 生成 `./chroma_db`；从别处跑（或用 `data/` 挂载）→ 生成 `./data/chroma_db`。实测两份并存：`chroma_db/` 96 条 embedding、`data/chroma_db/` 94 条（只读快照），差 2 条就是各自历史上跑过不同的对话。**这是相对路径假设被打破的实证**——同一份"记忆"在磁盘上分叉了，且没有任何机制察觉。
   - 备份：**没有**。没有任何 dump/快照/导出脚本；唯一的"数据管理工具"是 `reset_db.py`，而它是**删库脚本**（`reset_db.py:31-33` 删 `chroma_db`、`chat.db`、`logs/agent.log`，无确认、无备份）。
   - 一致性另外要注意：SQLite 与 Chroma **本来就是两个数据源**，双写无事务（Q2），所以"备份"必须两边同时做并保证时点接近，否则恢复后出现"记忆在 SQLite 但向量库里没有"。
@@ -504,7 +504,7 @@
 - **答题要点**：
   - 三层的真实状态：
     1. **工具层：有超时。** 和风 GEO/实况各 `timeout=5`（`weather.py:20,38`），博查 `timeout=10`（`search.py:35`），且超时/异常都降级成文案（Q37）。
-    2. **LLM 层：没有超时参数。** 五个调用点（`main.py:76-84, 94-103`；`memory_service.py:57-65`；`personality_state.py:81-89`）都**只传 model/messages/temperature/max_tokens**，没有 `timeout=` → 完全依赖 SDK 默认（默认 600s 级），一次卡住能把 `/chat` 请求挂死。
+    2. **LLM 层：没有超时参数。** 五个调用点（`main.py:76-84, 94-103`；`memory_service.py:72-80`；`personality_state.py:81-89`）都**只传 model/messages/temperature/max_tokens**，没有 `timeout=` → 完全依赖 SDK 默认（默认 600s 级），一次卡住能把 `/chat` 请求挂死。
     3. **HTTP 层：兜底能返回，但语义失真。**
   - **死代码（很值得主动指出）**：`chat_post` 里 `except TimeoutError: raise LLMTimeoutException()`（`main.py:272-273`）→ `LLMTimeoutException` 是 504（`exceptions.py:13-15`）。但：① openai SDK 超时抛的是 `APITimeoutError`（继承自 `APIError`），**不是内置 `TimeoutError`**；② 就算抛的是，非流式的 LLM 调用发生在 `agent._call_llm` 里，而它自带 `except Exception → 返回兜底文案`（`main.py:86-87`）把异常吞掉了；`_call_llm_stream` 同理（`:108-110`）。→ **504 分支实际上不可能被触发**，`LLMTimeoutException` 和 `MemoryFetchException`（`exceptions.py:18-20`，全仓无引用）都是死异常。面试时主动说"我核查过这条分支走不到"是加分项。
   - 兜底的副作用：`@app.exception_handler(Exception)`（`exceptions.py:38-43`）把所有未捕获异常统一成 `{"error":"服务器内部错误"}` 500 —— 对外安全，对内信息量为零（真实原因只在日志里，且没有异常 ID 关联请求）。

@@ -1,6 +1,6 @@
 # 希格雯桌宠 — 项目档案（侦察报告）
 
-> 侦察时间：2026-09-24（rev4：记忆系统重构——主体过滤 / 相关性阈值与融合重排 / 遗忘机制；人格 sad 死锁修复）｜分支 `memory-refactor`（HEAD `e990162`，基线 `3bc471c`）｜范围：仓库全部首方代码（排除 `venv/`）
+> 侦察时间：2026-09-24（rev4：记忆系统重构——主体过滤 / 相关性阈值与融合重排 / 遗忘机制；人格 sad 死锁修复；`eca5139` 两处缺陷修复）｜分支 `memory-refactor`（基线 `3bc471c`，该分支最新提交见 `git log`）｜范围：仓库全部首方代码（排除 `venv/`）
 > 所有结论均标注 `文件:行号`。无实现依据的一律标注"未找到相关实现"。修订内容见 §9。
 
 ## 0. 先纠正三处与 README 不符的事实
@@ -21,7 +21,7 @@
 - 校验/配置：pydantic 2.13.3（schemas.py）、python-dotenv（.env.example 四键：DEEPSEEK/HEFENG/BOCHA）
 - 向量库：chromadb 1.5.9（PersistentClient）+ sentence-transformers 5.5.1 + `BAAI/bge-small-zh-v1.5`（retrievers/anime_kb.py:11-18）
 - 结构化存储：SQLite（标准库 sqlite3，无 ORM），单文件 `chat.db`（memory_service.py:24）
-- 中文分词：jieba 0.42.1（memory_service.py:5,282）
+- 中文分词：jieba 0.42.1（memory_service.py:5,293）
 - 外部 API：和风天气（tools/weather.py:17-43）、博查搜索（tools/search.py:35）
 - 测试：pytest 9.0.3 + fastapi TestClient，**21 个用例**（3 smoke + 4 响应契约 + 6 主体过滤 + 4 遗忘 + 3 人格 + 1 召回回填），实测 `21 passed in 11.99s`（`HF_HUB_OFFLINE=1`、Python 3.12.3；4 个契约用例已用变异测试验证有效性）
 
@@ -53,7 +53,7 @@
 2. `_handle_chat_stream` 调 `_build_chat_context`（main.py:162-187）组装 System Prompt 并返回 `(system_prompt, memories)` 二元组，Prompt 四段拼接：
    - `personality.build_system_prompt()` — 情绪+好感度+语气指令（personality_state.py:105-120）
    - `get_recent_messages(6)` — 最近 3 轮原文（test_api.py:39-50 → SQLite `messages`）
-   - `recall_memories(msg, top_k=3)` — 长期记忆（memory_service.py:374），**同时作为返回值回传给响应层**
+   - `recall_memories(msg, top_k=3)` — 长期记忆（memory_service.py:428），**同时作为返回值回传给响应层**
    - `_build_rag_context(msg)` — 角色设定（main.py:117-146 → retrievers/anime_kb.py:32）
 3. `agent.run_stream`（agent.py:110-151）：
    - 阶段一 `_run_react_planning` 放线程池（agent.py:121-123），最多 3 步（agent.py:15），每步 `_call_llm` 非流式 → 命中 `Action:` 则执行工具（weather/search）并把 `Observation` 追加进 context（agent.py:72）
@@ -75,27 +75,27 @@
 
 `memories` 表 rev4 新增三列：`owner`（主人/他人）、`status`（active/expired/superseded）、`access_count`（memory_service.py:37-39）；旧库用 `PRAGMA table_info` + `ALTER TABLE` 幂等补列（memory_service.py:44-55）。
 
-**写入（memory_service.py:178-237）**
+**写入（memory_service.py:189-248）**
 
 - 时机：**每条 AI 回复后**（流式 main.py:227-231 / 非流式 main.py:206-208），由 LLM 抽取（`extract_facts`，memory_service.py:59-93）。约束写在 prompt 里：最多 3 条、每条 ≤50 字、显式禁止天气/新闻等时效信息、importance 由模型自评（memory_service.py:61-70）。
-- 去重：`_normalize_fact` 去尾部标点（memory_service.py:96-98）后**全表逐行比对**（memory_service.py:194-198），命中即跳过。
-- **主体标记（rev4 新增）**：`_infer_owner` / `_infer_query_owner` 按文本词形推断主体——形如"主人的同事…"或"我同事…"判为 `他人`，否则 `主人`（关系词表与正则 memory_service.py:101-111，推断函数 :114-121）。
-- **时效软删除（rev4 新增）**：命中 `_STALE_MARKERS`（以前/之前/曾经/去年/上个月/上周/昨天/前天…，memory_service.py:125-128）的事实，写入 SQLite 但 `status='expired'`，且**不进向量库**（memory_service.py:136-138,188,218-222）——软删除，留痕可查。
-- **冲突覆盖（rev4 新增）**：新事实命中 `_CURRENT_MARKERS`（已经/现在/换成/搬到/转岗/戒了/决定不…，memory_service.py:130-133）且与同主体旧记忆 keywords 相交时，旧记忆置 `status='superseded'` 并调 `user_memory.delete()` 撤出向量库（memory_service.py:145-175,237）。**这是 `delete()` 的第一个真实调用者。**
-- Chroma 双写失败只 log 不补偿（memory_service.py:225-234）。
+- 去重：`_normalize_fact` 去尾部标点（memory_service.py:96-98）后**全表逐行比对**（memory_service.py:205-209），命中即跳过。
+- **主体标记（rev4 新增）**：`_infer_owner` / `_infer_query_owner` 按文本词形推断主体——形如"主人的同事…"或"我同事…"判为 `他人`，否则 `主人`（关系词表与正则 memory_service.py:101-111，推断函数 :116-132）。
+- **时效软删除（rev4 新增）**：命中 `_STALE_MARKERS`（以前/之前/曾经/去年/上个月/上周/昨天/前天…，memory_service.py:136-139）的事实，写入 SQLite 但 `status='expired'`，且**不进向量库**（memory_service.py:147-149,199,229-233）——软删除，留痕可查。
+- **冲突覆盖（rev4 新增）**：新事实命中 `_CURRENT_MARKERS`（已经/现在/换成/搬到/转岗/戒了/决定不…，memory_service.py:141-144）且与同主体旧记忆 keywords 相交时，旧记忆置 `status='superseded'` 并调 `user_memory.delete()` 撤出向量库（memory_service.py:156-186,248）。**这是 `delete()` 的第一个真实调用者。**
+- Chroma 双写失败只 log 不补偿（memory_service.py:236-245）。
 
-**检索（`recall_memories`，memory_service.py:374-443）——rev4 已重写为七步**
+**检索（`recall_memories`，memory_service.py:428-500）——rev4 已重写为七步**
 
-1. 主体推断：`_infer_query_owner(query)`（memory_service.py:383-384）。
-2. 向量路：候选池 `RECALL_CANDIDATE_K=15`，`user_memory.recall(max_distance=RECALL_MAX_DISTANCE=0.8)` 做**绝对阈值**过滤（memory_service.py:388-394；user_memory.py:92-104）——超阈值的直接丢弃，这是 rev3 缺失的第一道闸。
-3. 关键词路（兜底）：jieba 分词 + 停用词表（memory_service.py:240-276）+ 2-4 字中文片段补充（memory_service.py:291-293）；**无有效关键词时显式返回空**，旧的 `1=1` 兜底已删除（memory_service.py:306-310）；SQL 加 `AND status='active'`（memory_service.py:321）。
-4. 按 id 去重合并，向量结果先入（memory_service.py:401-408）。
-5. **主体过滤**：只保留 `owner` 与提问主体一致的记忆（memory_service.py:410-411）。
-6. **遗忘过滤**：`_recency_factor = exp(-λ·天数) × (1+ln(1+access_count))`，低于 `RECALL_MIN_RECENCY=0.05` 丢弃（memory_service.py:356-371,417-423）。λ=0.05/天 → 约 **60 天**未访问即永久出列（exp(-0.05×60)≈0.0498 < 0.05）。
-7. **融合重排 + 相对阈值**：`score = 0.9·(1−distance) + 0.1·(importance/10)`，无 distance 的关键词路给 `0.4·importance/10` 的弱分，再乘遗忘因子；排序后**只保留与最佳分差在 `RECALL_SCORE_MARGIN=0.08` 内的**，取 top_k（memory_service.py:425-443）。
+1. 主体推断：`_infer_query_owner(query)`（memory_service.py:437-438）。
+2. 向量路：候选池 `RECALL_CANDIDATE_K=15`，`user_memory.recall(max_distance=RECALL_MAX_DISTANCE=0.8)` 做**绝对阈值**过滤（memory_service.py:442-448；user_memory.py:96-108）——超阈值的直接丢弃，这是 rev3 缺失的第一道闸。
+3. 关键词路（兜底）：jieba 分词 + 停用词表（memory_service.py:251-287）+ 2-4 字中文片段补充（memory_service.py:302-304）；**无有效关键词时显式返回空**，旧的 `1=1` 兜底已删除（memory_service.py:317-321）；SQL 加 `AND status='active'`（memory_service.py:332）。
+4. 按 id 去重合并，向量结果先入（memory_service.py:455-462）。
+5. **主体过滤**：只保留 `owner` 与提问主体一致的记忆（memory_service.py:467-468）。
+6. **遗忘过滤**：`_recency_factor = exp(-λ·天数) × (1+ln(1+access_count))`，低于 `RECALL_MIN_RECENCY=0.05` 丢弃（memory_service.py:367-382,474-480）。λ=0.05/天 → 约 **60 天**未访问即永久出列（exp(-0.05×60)≈0.0498 < 0.05）。
+7. **融合重排 + 相对阈值**：`score = 0.9·(1−distance) + 0.1·(importance/10)`，无 distance 的关键词路给 `0.4·importance/10` 的弱分，再乘遗忘因子；排序后**只保留与最佳分差在 `RECALL_SCORE_MARGIN=0.08` 内的**，取 top_k（memory_service.py:482-500）。
 
-- **排序口径：distance 为主（权重 0.9）、importance 为辅（0.1）**，distance 第一次真正参与决策；全部阈值与权重集中在 memory_service.py:346-353。注意 `min_importance` 仍恒传 1，等于不过滤（memory_service.py:392）。
-- 召回后对**进入 Prompt 的每条**记忆调 `update_accessed`，刷新 `last_accessed` 并累加 `access_count`（main.py:179-180；memory_service.py:446-455）。
+- **排序口径：distance 为主（权重 0.9）、importance 为辅（0.1）**，distance 第一次真正参与决策；全部阈值与权重集中在 memory_service.py:357-364。注意 `min_importance` 仍恒传 1，等于不过滤（memory_service.py:446）。
+- 召回后对**进入 Prompt 的每条**记忆调 `update_accessed`，刷新 `last_accessed` 并累加 `access_count`（main.py:179-180；memory_service.py:503-512）。
 - 遗忘是**三条路并行**：时效软删除（写入即失效）、冲突覆盖（新事实取代旧事实）、时间衰减×访问频率（召回时过滤）。单靠时间衰减在本项目评测条件下恒等无效（120 条用例同刻写入，`exp(-λ·Δt)≡1`），真正能区分"过期"的信号是文本里的时效标记——这是"评测约束倒逼设计"的实例。
 
 **实测**
@@ -130,7 +130,7 @@
 4. **两条流式路径不等价**：无工具时 `for char in direct_answer` 是逐字假流式，有工具时才是真 token 流。agent.py:134-135 vs 148
 5. **meta 包前置 + 旧状态**：先发情绪再生成，牺牲一轮实时性换取客户端能提前切立绘（语义已在 §5 固化为契约）。main.py:245-249
 6. **RAG 双层召回**：语义保广度 + tag 保精度，`dict.fromkeys` 去重保序。main.py:122-135
-7. **记忆混合召回**：向量优先、关键词兜底，按 id 而非文本合并。memory_service.py:374-443
+7. **记忆混合召回**：向量优先、关键词兜底，按 id 而非文本合并。memory_service.py:428-500
 8. **去重靠标点归一化**：`_normalize_fact` 解决"…喝奶茶。"≠"…喝奶茶"。memory_service.py:96-98
 9. **情绪交给 LLM 判断**而非词典/规则，接受额外延迟换语义泛化。personality_state.py:73-103
 10. **好事感度非对称**（+2/-10）与**怒气惯性 3 轮**——用数值设计模拟"记仇"。personality_state.py:127-131,141-143
@@ -151,19 +151,19 @@
 *rev4 已解决（保留记录，供面试对比）*
 
 - ~~无遗忘、无衰减、无压缩、无重排~~ → 已实现：时效软删除 + 冲突覆盖 + 时间衰减×访问频率 + distance 融合重排（见 §4）。
-- ~~合并后按 importance 硬排丢掉向量相关性序~~ → 已改为 `0.9·(1−distance)+0.1·importance`（memory_service.py:425-434）。
-- ~~关键词路 `1=1` 兜底静默返回全表最重要的 3 条~~ → 已改为显式返回空并记日志（memory_service.py:306-310）。
+- ~~合并后按 importance 硬排丢掉向量相关性序~~ → 已改为 `0.9·(1−distance)+0.1·importance`（memory_service.py:482-491）。
+- ~~关键词路 `1=1` 兜底静默返回全表最重要的 3 条~~ → 已改为显式返回空并记日志（memory_service.py:317-321）。
 
 *仍然存在*
 
 - ~~访问频率加成对语义路实际失效~~ **已修复（eca5139）**：`recall_memories` 合并后新增 `_enrich_from_sqlite`，用 SQLite 权威值就地回填 `access_count`/`last_accessed`/`owner`/`status`（memory_service.py:385-424，调用点 :465）；`user_memory.recall` 的向量 dict 也补齐了 `access_count`/`last_accessed` 字段（retrievers/user_memory.py:85-89）。回归测试 `tests/test_memory_recall.py::test_vector_path_access_count_reflected` 用真实向量库断言语义命中记忆带上 SQLite 的 access_count 且 `_recency > 1.0`。
-- **时间戳解析失败会静默不衰减**：`_recency_factor` 用 `datetime.fromisoformat(str(ts))`，`ValueError/TypeError` 一律按 0 天处理（memory_service.py:364-368）→ 时间格式一旦变化，该批记录变成"永不遗忘"，且**不报错、无日志**。
-- **时效标记是关键词启发式，会误伤**：`_is_expired_fact` 只做子串匹配（memory_service.py:136-138）。"我以前是军人，所以很自律""之前学的那点东西还有用"这类**长期有效**的自我描述会被直接判过期、写入即不入库——而软删除没有召回路径，**误判的代价是信息永久丢失**（仅在 SQLite 留痕）。
-- **冲突覆盖按 keywords 集合相交判定，过宽**：只要新旧记忆共享**任意一个** keyword 就覆盖（memory_service.py:165-166）。keywords 由 LLM 生成且常含宽泛词（"饮料""居住""工作"），一条新的"现状"事实可能连带撤掉若干条其实仍有价值的旧记忆。
+- **时间戳解析失败会静默不衰减**：`_recency_factor` 用 `datetime.fromisoformat(str(ts))`，`ValueError/TypeError` 一律按 0 天处理（memory_service.py:375-379）→ 时间格式一旦变化，该批记录变成"永不遗忘"，且**不报错、无日志**。
+- **时效标记是关键词启发式，会误伤**：`_is_expired_fact` 只做子串匹配（memory_service.py:147-149）。"我以前是军人，所以很自律""之前学的那点东西还有用"这类**长期有效**的自我描述会被直接判过期、写入即不入库——而软删除没有召回路径，**误判的代价是信息永久丢失**（仅在 SQLite 留痕）。
+- **冲突覆盖按 keywords 集合相交判定，过宽**：只要新旧记忆共享**任意一个** keyword 就覆盖（memory_service.py:176-177）。keywords 由 LLM 生成且常含宽泛词（"饮料""居住""工作"），一条新的"现状"事实可能连带撤掉若干条其实仍有价值的旧记忆。
 - ~~`owner` 推断依赖固定词形，抽取侧不保证~~ **部分修复（eca5139）**：`_infer_owner` 新增自然表述分支 `_OWNER_OTHER_BARE_RE`——事实直接以关系词开头（"同事小李喜欢美式咖啡""妹妹对芒果过敏"）也判 `他人`，同时保留"主人有个妹妹…""主人被同事抢了功劳"归主人（memory_service.py:111-126）。回归测试 `tests/test_memory_owner.py::test_owner_other_natural_phrasing`。**残留**：选的是"正则兼容"而非"prompt 加约束"，所以 `extract_facts` 的 prompt 仍未要求归属前缀（memory_service.py:59-70）；抽取侧若产出更自由的说法（如"小李是我同事，他喜欢美式咖啡"）仍可能漏判，关系词表也不含"闺蜜/发小"等口语词（memory_service.py:102-108）。
 - **用 recall 换 precision**：`RECALL_SCORE_MARGIN=0.08` 的相对阈值 + `top_k=3` 把平均召回条数压到 **1.17**（tests/eval/eval_report.md:25）。低噪声、低覆盖是明确取舍，但 0.8 / 0.08 / 0.9 / 0.1 全是经验值、无数据支撑，记忆规模上去后必须重调。
-- 去重仍是 **O(n) 全表扫描**（memory_service.py:194-198），量大即瓶颈；且 check-then-act 非原子（无唯一索引兜底），并发下仍可能重复写入。
-- SQLite 与 Chroma 双写无事务无补偿，失败仅 log（memory_service.py:225-234）；rev4 的冲突覆盖同样是"改 status + 删向量"两步非事务（memory_service.py:166-170），中途失败会造成两边不一致。
+- 去重仍是 **O(n) 全表扫描**（memory_service.py:205-209），量大即瓶颈；且 check-then-act 非原子（无唯一索引兜底），并发下仍可能重复写入。
+- SQLite 与 Chroma 双写无事务无补偿，失败仅 log（memory_service.py:236-245）；rev4 的冲突覆盖同样是"改 status + 删向量"两步非事务（memory_service.py:177-181），中途失败会造成两边不一致。
 - 提取粒度失准：实测把「助手是蓝色头发，不是粉色」当成用户事实存入（logs/agent.log:43 写入），且该伪事实在 rev4 后仍被召回注入（logs/agent.log:800 distance 0.5988、:842 distance 0.6445）。
 
 **稳定性/工程级**
@@ -209,13 +209,17 @@ rev4 首轮只改了 §4/§5/§8，遗留的 rev3 行号在本轮清掉（逐条
 
 **同批同步**：`docs/interview_qa.md` 的 Q5（整段按 rev4 重写——旧答案仍在讲已被删除的 `merged.sort(key=importance, reverse=True)`，与 Q7 自相矛盾）与 Q2/Q3/Q6/Q8/Q23/Q39 的过时行号；`tests/eval/eval_report.md` 的 3 处旧措辞（`:8` 排序口径、`:28` `memory_text` 行号、`:68` 遗忘失败聚类标签）。
 
-**仍待同步（超出本轮点名范围）**：`docs/interview_qa.md` 封面第 7 行与 Q15/Q40 仍引用 rev3 的「`logs/agent.log` 573 行」「tag 命中 2 次」。实测该日志为 **1432 行**（append-only，跑测试或真实对话都会继续增长，此处与 §4 的统计同为一个快照值），带 tag 判定的 **67 条**中非「无」**12 条（17.9%）**（其中 11 条为单字 tag `女`）——与 §4 的数字已对不上，需单独一轮修正；另 `tests/eval/eval_memory.py:312` 的注释仍写 `main.py:163-166`，实为 `:175-177`。
+**上一轮遗留项已清零（2026-09-24 晚）**：本段原列的三项各已处理——① `docs/interview_qa.md` 封面 `:7` 与 Q15/Q40 的日志口径已对齐 §4（`573` 行 → **1432 行**，带 tag 判定 67 条中非「无」12 条），见 `ded19b9`；② `tests/eval/eval_memory.py` 的注释锚点已由 `main.py:163-166` 改为 `:175-177`，见 `98e5131`；③ §8 的两条缺陷（语义路频率恒 1.0、`owner` 漏判自然表述）已由 `eca5139` 修复并各补 1 条回归测试，§1 用例数相应 19 → **21**，见 `e9aef6a`。
+
+**行号位移已重算（2026-09-24 晚，本轮）**：`eca5139` 改代码引入的位移已逐条回源码核对并落定。`memory_service.py` **459 → 516 行**（分段常量：旧 `:1-109` 不变、旧 `:110-114` → `+2`、旧 `:117-373` → `+11`、旧 `:374-408` → `+54`、旧 `:409-459` → `+57`）；`retrievers/user_memory.py` **128 → 132 行**（旧 `:1-84` 不变、旧 `:85` → `:88`、旧 `:86-128` → `+4`）。本轮实际重算的行号锚点：**本文档 34 处**、`docs/interview_qa.md` **39 处**（其中 24 处属 `eca5139` 位移，另 15 处是更早遗留、仍停在 270 行基准的锚点，含封面基准行，已一并回源码核对）。`docs/drafts/` 两篇的锚点基准是**重构前提交 `3bc471c`**（`memory_service.py` 270 行），与 `eca5139` 无关，故未动行号，只在编辑说明里把基准写明。§8 本轮前**新旧编号混用**：`eca5139` 新写的 `memory_service.py:385-424`/`:465`/`:111-126`、`retrievers/user_memory.py:85-89` 已用新号（本轮未动），紧邻的旧条目仍是旧号（已映射）。注：§9 前文「`旧号` → `新号`」记录的是 **rev4 时点**的映射结果，属历史记录，未随本轮再改。
+
+**校验工具的能力边界（本轮实测）**：`check_anchors.py` 对上述漂移**全部报「✅ 全部锚点行号落在文件范围内」**——它只校验行号是否越界，不校验该行内容是否仍支持结论。因此「校验通过」≠「锚点已对」；改过被引用文件后必须另跑位移映射（`doc-anchor-guard/scripts/remap_anchors.py --file <f> --rev <旧提交> --lines <旧行号>`）。
 
 **验收缺口（如实记录）**
 
 - rev4 的 98.3% **只覆盖检索层**（`store_memory` + `recall_memories`），**不覆盖** `extract_facts` 抽取质量与真实 LLM 回复——WSL 环境访问不到 DeepSeek API，`eval_report.md:9` 自己也写明了。
 - 遗忘类 91.7% 的 2 条失败已定位为**判定子串假阳性**（`forget_005` 新事实本身含"可乐"、`forget_008` 召回了含"想学"的闲聊），**两条旧事实其实都已被正确过期**，非机制失效；但 `eval_report.md:68` 的失败聚类标签"（无遗忘机制）"是重构前的旧措辞，尚未改。
-- 19 个 pytest 用例全为 mock 级；全仓仍**无 CI**、**无真实 LLM 端到端测试**。
+- **21 个 pytest 用例**：3 smoke（`test_chat.py`，TestClient + mock LLM 调用）+ 4 响应契约（`test_response_contract.py`，全 mock、不写任何库）+ 14 记忆/人格单测（`tmp_path` 隔离的**真实 SQLite**，其中 `test_memory_recall.py` 那 1 条还用**真实 `UserMemoryRAG`** + tmp chroma）。所以"全为 mock 级"这个说法已不成立：契约层是全 mock，记忆/人格层跑的是真库。但整体仍**不覆盖真实 LLM**——全仓仍**无 CI**、**无真实 LLM 端到端测试**。
 
 **rev3（2026-09-23）— 响应契约形状统一 + 契约测试入库**
 
