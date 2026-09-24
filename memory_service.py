@@ -107,13 +107,24 @@ _RELATION_WORDS = (
 )
 # "主人的<关系词>" / "主人家的<关系词>" → 该条记忆的主体是他人
 _OWNER_OTHER_RE = re.compile(rf"^主人(?:的|家的)\s*(?:{_RELATION_WORDS})")
+# 自然表述：事实直接以关系词开头（可跟姓名/称呼），如"同事小李喜欢美式咖啡""妹妹对芒果过敏"
+_OWNER_OTHER_BARE_RE = re.compile(rf"^(?:{_RELATION_WORDS})")
 # 提问主体："我的<关系词>" → 问的是他人；否则默认问主人自己
 _QUERY_OTHER_RE = re.compile(rf"我(?:的|家)?\s*(?:{_RELATION_WORDS})")
 
 
 def _infer_owner(fact: str) -> str:
-    """从事实文本推断主体：默认"主人"，形如"主人的同事…"判为"他人"。"""
-    return "他人" if _OWNER_OTHER_RE.match(fact.strip()) else "主人"
+    """从事实文本推断主体：默认"主人"。
+
+    命中以下任一即判为"他人"：
+    - 显式归属："主人的同事…" / "主人家的妹妹…"
+    - 自然表述：事实直接以关系词开头（可带姓名），如"同事小李喜欢美式咖啡"。
+      注意"主人有个妹妹…""主人被同事抢了功劳"以"主人"开头，仍归主人。
+    """
+    f = fact.strip()
+    if _OWNER_OTHER_RE.match(f) or _OWNER_OTHER_BARE_RE.match(f):
+        return "他人"
+    return "主人"
 
 
 def _infer_query_owner(query: str) -> str:
@@ -371,6 +382,49 @@ def _recency_factor(m: dict) -> float:
     return decay * freq
 
 
+def _enrich_from_sqlite(memories: list[dict]) -> None:
+    """用 SQLite（权威源）就地回填 access_count/last_accessed/owner/status。
+
+    向量路返回的 dict 不含权威的 access_count/last_accessed（user_memory.recall 只有
+    Chroma 里的旧快照或占位值），而合并时向量侧优先（`vec_results + kw_results`）——
+    若不回填，凡被语义命中的记忆访问频率恒为 1.0、遗忘基准退化成 created_at。
+    这里统一以 SQLite 为准，保证生产路径（recall_memories）拿到真实访问统计。
+    """
+    ids = []
+    for m in memories:
+        try:
+            ids.append(int(m.get("id")))
+        except (TypeError, ValueError):
+            continue
+    if not ids:
+        return
+
+    placeholders = ",".join("?" * len(ids))
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        rows = conn.execute(
+            f"SELECT id, access_count, last_accessed, owner, status "
+            f"FROM memories WHERE id IN ({placeholders})",
+            ids,
+        ).fetchall()
+        conn.close()
+    except sqlite3.Error as e:
+        logger.error(f"[UserMemory] 回填访问统计失败: {e}")
+        return
+
+    by_id = {r[0]: r for r in rows}
+    for m in memories:
+        try:
+            row = by_id.get(int(m.get("id")))
+        except (TypeError, ValueError):
+            row = None
+        if row:
+            m["access_count"] = row[1] or 0
+            m["last_accessed"] = row[2]
+            m["owner"] = row[3] or m.get("owner") or "主人"
+            m["status"] = row[4] or "active"
+
+
 def recall_memories(query: str, top_k: int = 5, owner: str | None = None) -> list[dict]:
     """
     混合召回：ChromaDB 语义召回（优先） + jieba 关键词召回（兜底）。
@@ -406,6 +460,9 @@ def recall_memories(query: str, top_k: int = 5, owner: str | None = None) -> lis
         if mid and mid not in seen:
             seen.add(mid)
             merged.append(r)
+
+    # === 3.5 回填权威字段：修正向量路缺失的 access_count/last_accessed/owner/status ===
+    _enrich_from_sqlite(merged)
 
     # === 4. 主体过滤：只保留与提问主体一致的记忆 ===
     merged = [r for r in merged if (r.get("owner") or "主人") == owner]

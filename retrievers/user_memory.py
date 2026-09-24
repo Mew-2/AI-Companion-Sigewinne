@@ -82,7 +82,11 @@ class UserMemoryRAG:
                     "keywords": kw,
                     "importance": meta.get("importance", 5),
                     "owner": meta.get("owner", "主人"),
+                    # access_count/last_accessed 在 Chroma 里没有权威值，
+                    # 这里先占位，由 memory_service.recall_memories 从 SQLite 回填权威值。
+                    "access_count": meta.get("access_count", 0),
                     "created_at": meta.get("created_at", ""),
+                    "last_accessed": meta.get("last_accessed", ""),
                     "distance": (
                         results["distances"][0][i] if results.get("distances") else None
                     ),

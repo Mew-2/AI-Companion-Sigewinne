@@ -17,6 +17,15 @@ def test_owner_other_facts():
     assert ms._infer_owner("主人的朋友家的猫叫咪咪") == "他人"
 
 
+def test_owner_other_natural_phrasing():
+    # 抽取侧可能产出不带"主人的"前缀的自然表述（缺陷②回归）
+    assert ms._infer_owner("同事小李喜欢美式咖啡") == "他人"
+    assert ms._infer_owner("妹妹对芒果过敏") == "他人"
+    # 以"主人"开头的仍然是主人自己的记忆，不能被关系词误伤
+    assert ms._infer_owner("主人有个妹妹，现在在读高中") == "主人"
+    assert ms._infer_owner("主人被同事抢了功劳") == "主人"
+
+
 def test_query_owner_default_self():
     assert ms._infer_query_owner("我最喜欢喝什么饮料？") == "主人"
     assert ms._infer_query_owner("我家里有哪些兄弟姐妹？") == "主人"
@@ -27,7 +36,10 @@ def test_query_owner_other():
     assert ms._infer_query_owner("我妹妹对什么过敏？") == "他人"
 
 
-def test_recall_filters_by_owner(monkeypatch):
+def test_recall_filters_by_owner(tmp_path, monkeypatch):
+    # 隔离到空 tmp DB：否则 _enrich_from_sqlite 会用真实 chat.db 覆盖 mock 的 owner
+    monkeypatch.setattr(ms, "DB_PATH", str(tmp_path / "chat.db"))
+    ms.init_db()
     monkeypatch.setattr(ms, "_recall_by_keywords", lambda q, top_k=5: [])
     monkeypatch.setattr(
         ms.user_memory_rag,
