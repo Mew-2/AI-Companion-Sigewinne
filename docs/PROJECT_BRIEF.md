@@ -23,7 +23,7 @@
 - 结构化存储：SQLite（标准库 sqlite3，无 ORM），单文件 `chat.db`（memory_service.py:24）
 - 中文分词：jieba 0.42.1（memory_service.py:5,282）
 - 外部 API：和风天气（tools/weather.py:17-43）、博查搜索（tools/search.py:35）
-- 测试：pytest 9.0.3 + fastapi TestClient，**19 个用例**（3 smoke + 4 响应契约 + 5 主体过滤 + 4 遗忘 + 3 人格），实测 `19 passed in 11.93s`（`HF_HUB_OFFLINE=1`、Python 3.12.3；4 个契约用例已用变异测试验证有效性）
+- 测试：pytest 9.0.3 + fastapi TestClient，**21 个用例**（3 smoke + 4 响应契约 + 6 主体过滤 + 4 遗忘 + 3 人格 + 1 召回回填），实测 `21 passed in 11.99s`（`HF_HUB_OFFLINE=1`、Python 3.12.3；4 个契约用例已用变异测试验证有效性）
 
 ## 2. 模块地图
 
@@ -101,7 +101,7 @@
 **实测**
 
 - 检索层评测（tests/eval/eval_report.md，120 条用例，real 后端）：总准确率 **98.3%**（118/120）；分类 accuracy——fact / long_context / emotion / distractor 均 **100%**、forgetting **91.7%**；平均召回条数 1.17、平均注入 21.8 token、召回延迟 P95 20.0ms。重构前基线 60.8%（干扰项仅 4.2%、遗忘 0%）。
-- 遗留的真实问题之一：**抽取粒度失准仍在**——`助手是蓝色头发，不是粉色`（"关于助手"的伪事实）在 logs/agent.log:43 被写入，且在 rev4 之后仍被召回注入（logs/agent.log:800,842，distance 0.5988）。`owner` 推断救不了它：该条不以"主人的<关系词>"开头，被默认为 `主人`。
+- 遗留的真实问题之一：**抽取粒度失准仍在**——`助手是蓝色头发，不是粉色`（"关于助手"的伪事实）在 logs/agent.log:43 被写入，且在 rev4 之后仍被召回注入（logs/agent.log:800 distance 0.5988、:842 distance 0.6445）。`owner` 推断救不了它：该条不以"主人的<关系词>"开头，被默认为 `主人`。
 - 遗留问题之二：**短查询向量稀释**依旧——`记好了，我是ZZDW` 召回「日文名/韩文名」（data/logs/agent.log:1-6）。tag 旁路命中率极低：logs/agent.log 中带 tag 判定的日志共 **67 条**，非"无"命中仅 **12 条（17.9%）**，其中 **11 次是单字 tag `女`**（:84,:154,:255,:468,:579,:690,:802,:915,:1030,:1163,:1301），另 1 次 `美露莘`（:65）。
 
 ## 5. 情绪系统现状
@@ -156,15 +156,15 @@
 
 *仍然存在*
 
-- **访问频率加成对语义路实际失效**：`freq = 1+ln(1+access_count)`（memory_service.py:370）读的是 SQLite 列，但向量路返回的 dict **不含 `access_count`/`last_accessed`**（user_memory.py:78-90 只给 id/fact/keywords/importance/owner/created_at/distance），而合并时向量优先（memory_service.py:404）——凡被向量路命中的记忆，频率恒为 1.0，衰减基准退化成 `created_at`（memory_service.py:362）。"热点记忆抗遗忘"只在纯关键词命中时成立。
+- ~~访问频率加成对语义路实际失效~~ **已修复（eca5139）**：`recall_memories` 合并后新增 `_enrich_from_sqlite`，用 SQLite 权威值就地回填 `access_count`/`last_accessed`/`owner`/`status`（memory_service.py:385-424，调用点 :465）；`user_memory.recall` 的向量 dict 也补齐了 `access_count`/`last_accessed` 字段（retrievers/user_memory.py:85-89）。回归测试 `tests/test_memory_recall.py::test_vector_path_access_count_reflected` 用真实向量库断言语义命中记忆带上 SQLite 的 access_count 且 `_recency > 1.0`。
 - **时间戳解析失败会静默不衰减**：`_recency_factor` 用 `datetime.fromisoformat(str(ts))`，`ValueError/TypeError` 一律按 0 天处理（memory_service.py:364-368）→ 时间格式一旦变化，该批记录变成"永不遗忘"，且**不报错、无日志**。
 - **时效标记是关键词启发式，会误伤**：`_is_expired_fact` 只做子串匹配（memory_service.py:136-138）。"我以前是军人，所以很自律""之前学的那点东西还有用"这类**长期有效**的自我描述会被直接判过期、写入即不入库——而软删除没有召回路径，**误判的代价是信息永久丢失**（仅在 SQLite 留痕）。
 - **冲突覆盖按 keywords 集合相交判定，过宽**：只要新旧记忆共享**任意一个** keyword 就覆盖（memory_service.py:165-166）。keywords 由 LLM 生成且常含宽泛词（"饮料""居住""工作"），一条新的"现状"事实可能连带撤掉若干条其实仍有价值的旧记忆。
-- **`owner` 推断依赖固定词形，抽取侧不保证**：`_OWNER_OTHER_RE` 要求事实以 `主人(的|家的)+关系词` 开头（memory_service.py:109），但 `extract_facts` 的 prompt 从不要求这个前缀（memory_service.py:61-70）。LLM 写成"同事小李喜欢美式咖啡"就会被判成 `主人`，他人事实照样混进主人召回；关系词表也不含"闺蜜/发小"等口语词（memory_service.py:102-107）。现有单测只覆盖带前缀的写法（tests/test_memory_owner.py:6-27，全部 5 个用例都只覆盖带前缀的写法）。
+- ~~`owner` 推断依赖固定词形，抽取侧不保证~~ **部分修复（eca5139）**：`_infer_owner` 新增自然表述分支 `_OWNER_OTHER_BARE_RE`——事实直接以关系词开头（"同事小李喜欢美式咖啡""妹妹对芒果过敏"）也判 `他人`，同时保留"主人有个妹妹…""主人被同事抢了功劳"归主人（memory_service.py:111-126）。回归测试 `tests/test_memory_owner.py::test_owner_other_natural_phrasing`。**残留**：选的是"正则兼容"而非"prompt 加约束"，所以 `extract_facts` 的 prompt 仍未要求归属前缀（memory_service.py:59-70）；抽取侧若产出更自由的说法（如"小李是我同事，他喜欢美式咖啡"）仍可能漏判，关系词表也不含"闺蜜/发小"等口语词（memory_service.py:102-108）。
 - **用 recall 换 precision**：`RECALL_SCORE_MARGIN=0.08` 的相对阈值 + `top_k=3` 把平均召回条数压到 **1.17**（tests/eval/eval_report.md:25）。低噪声、低覆盖是明确取舍，但 0.8 / 0.08 / 0.9 / 0.1 全是经验值、无数据支撑，记忆规模上去后必须重调。
 - 去重仍是 **O(n) 全表扫描**（memory_service.py:194-198），量大即瓶颈；且 check-then-act 非原子（无唯一索引兜底），并发下仍可能重复写入。
 - SQLite 与 Chroma 双写无事务无补偿，失败仅 log（memory_service.py:225-234）；rev4 的冲突覆盖同样是"改 status + 删向量"两步非事务（memory_service.py:166-170），中途失败会造成两边不一致。
-- 提取粒度失准：实测把「助手是蓝色头发，不是粉色」当成用户事实存入（logs/agent.log:43 写入），且该伪事实在 rev4 后仍被召回注入（logs/agent.log:800,842，distance 0.5988）。
+- 提取粒度失准：实测把「助手是蓝色头发，不是粉色」当成用户事实存入（logs/agent.log:43 写入），且该伪事实在 rev4 后仍被召回注入（logs/agent.log:800 distance 0.5988、:842 distance 0.6445）。
 
 **稳定性/工程级**
 - ReAct 空响应无重试：日志实录 `[Step 0] 格式异常…LLM原始输出 (len=0)` 直接终止规划，靠二次总结兜底，白烧一次调用（agent.py:44-55,93-101）。
