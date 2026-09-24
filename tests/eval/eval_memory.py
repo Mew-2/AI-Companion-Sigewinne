@@ -310,7 +310,7 @@ def build_report(summary: dict, results: list[dict], args, elapsed: float) -> st
     add(f"| 平均召回条数 | {summary['recalled_n_mean']:.2f} |")
     add(f"| **平均注入 token** | **{summary['tokens_mean']:.1f}**（中位 {summary['tokens_median']:.1f}） |")
     add("")
-    add("> token 指召回结果被拼进 System Prompt 的那段文本的 token 数（`main.py:163-166` 的 `memory_text`），")
+    add("> token 指召回结果被拼进 System Prompt 的那段文本的 token 数（`main.py:175-177` 的 `memory_text`），")
     add("> 召回层自身不调 LLM，因此没有 API token 消耗；这个数字衡量的是**每轮对话被记忆占用的上下文成本**。")
     add("")
 
