@@ -5,7 +5,7 @@
 > 总耗时：34.4s｜token 计量：tiktoken cl100k_base（近似 DeepSeek 分词）
 > 召回后端：ChromaDB + `BAAI/bge-small-zh-v1.5`（真实向量检索）
 
-**评测范围**：只覆盖检索层（`store_memory` 写入 + `recall_memories` 召回 + importance 排序截断）。
+**评测范围**：只覆盖检索层（`store_memory` 写入 + `recall_memories` 召回 + distance 融合重排）。
 **不覆盖**：LLM 事实抽取（`extract_facts`）与回复生成——WSL 环境访问不到 DeepSeek API。
 **隔离**：脚本 chdir 到临时目录后才 import，生产 `chat.db` / `chroma_db` 未被写入。
 
@@ -25,7 +25,7 @@
 | 平均召回条数 | 1.17 |
 | **平均注入 token** | **21.8**（中位 19.0） |
 
-> token 指召回结果被拼进 System Prompt 的那段文本的 token 数（`main.py:163-166` 的 `memory_text`），
+> token 指召回结果被拼进 System Prompt 的那段文本的 token 数（`main.py:175-177` 的 `memory_text`），
 > 召回层自身不调 LLM，因此没有 API token 消耗；这个数字衡量的是**每轮对话被记忆占用的上下文成本**。
 
 ## 2. 分类准确率
@@ -65,7 +65,7 @@
 
 | 失败模式 | 条数 |
 |---|---|
-| 应遗忘却仍被召回（无遗忘机制） | 2 |
+| 应遗忘却仍被召回（判定子串假阳性，旧事实实已过期） | 2 |
 
 ## 5. 结论与缺口
 

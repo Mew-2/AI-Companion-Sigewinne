@@ -29,20 +29,20 @@
   - `messages` 表无 `session_id`、无清理、永久堆积（`schemas.py:7` 的 `session_id` 收下即丢）。
 
 ### Q2｜长期记忆为什么要 SQLite + Chroma 双写？两边各存什么？
-**锚点**：`memory_service.py:178-277`、`retrievers/user_memory.py:27-49`
+**锚点**：`memory_service.py:178-237`、`retrievers/user_memory.py:27-49`
 - **考察意图**：向量库与关系库的职责边界，以及双写一致性的代价意识。
 - **答题要点**：
-  - SQLite `memories` 是**权威源**：`fact/keywords/importance/owner/status/access_count/created_at/last_accessed`（`memory_service.py:30-46`），带去重、去排序、供关键词 LIKE 检索。`owner`（主人/他人）、`status`（active/superseded/expired）、`access_count` 是 rev4 记忆重构新增的列，旧库通过 `PRAGMA table_info` + `ALTER TABLE` 幂等迁移补列。
+  - SQLite `memories` 是**权威源**：`fact/keywords/importance/owner/status/access_count/created_at/last_accessed`（`memory_service.py:31-43`），带去重、去排序、供关键词 LIKE 检索。`owner`（主人/他人）、`status`（active/superseded/expired）、`access_count` 是 rev4 记忆重构新增的列，旧库通过 `PRAGMA table_info` + `ALTER TABLE` 幂等迁移补列。
   - Chroma `user_memories` 是**派生的向量索引**：只存 `documents=[fact]` + metadata（含 `owner`，`user_memory.py:37-50`），用于语义召回。
-  - 顺序是"先 SQLite 拿 `lastrowid`（`:232`）→ 再用 `str(memory_id)` 写 Chroma"，id 是两边的唯一关联键。这也解释了召回侧为什么要 `str(r.get("id"))` 统一类型：向量路 id 是 str、关键词路是 int。
+  - 顺序是"先 SQLite 拿 `lastrowid`（`:214`）→ 再用 `str(memory_id)` 写 Chroma"，id 是两边的唯一关联键。这也解释了召回侧为什么要 `str(r.get("id"))` 统一类型：向量路 id 是 str、关键词路是 int。
   - 代价：Chroma 写失败只 `logger.error` 不补偿，两边可能长期漂移；没有事务、没有对账任务。rev4 的"冲突覆盖/时效软删除"会**同时**改 SQLite `status` 并 `user_memory.delete()` 撤出向量，但仍是两步非事务操作。
 
 ### Q3｜写入去重为什么用"全表逐行比对"？这样写有什么问题？
-**锚点**：`memory_service.py:81-83, 94-98`
+**锚点**：`memory_service.py:96-98, 193-198`
 - **考察意图**：是否看得见 O(n) 与原子性。
 - **答题要点**：
   - `_normalize_fact` 只剥末尾标点（`rstrip("。！？，,.!?;；:： \t\n")`），解决"喝奶茶。"≠"喝奶茶"，但归一化规则是**应用层**的，无法用 `UNIQUE(fact)` 约束表达。
-  - 于是退化成 `SELECT id, fact FROM memories` 全表扫描 + Python 侧逐行比较（`:94-98`）——每写一条 O(n)（实测 `chat.db` 里仅 4 条记忆，量级压力未暴露）。
+  - 于是退化成 `SELECT id, fact FROM memories` 全表扫描 + Python 侧逐行比较（`:193-198`）——每写一条 O(n)（实测 `chat.db` 里仅 4 条记忆，量级压力未暴露）。
   - 更硬的缺陷：**check-then-act 非原子**。并发两次相同写入都可能通过检查再各插一行（无唯一索引兜底）。正解是加 `normalized_fact` 列 + `UNIQUE` 索引，或 `INSERT ... ON CONFLICT DO NOTHING`，把归一化下沉到写入路径。
 
 ### Q4｜🔥 压力题｜`_recall_by_keywords` 里的 `1=1` 兜底是什么？什么时候走到？后果多严重？
@@ -55,21 +55,23 @@
   - 可延伸：关键词路仍按 `ORDER BY importance` 排序（未做独立相关性重排），但它现在是**兜底**且结果会并入 `recall_memories` 的融合重排，所以"importance 当相关性"的残留问题只影响兜底路。
 
 ### Q5｜向量路和关键词路为什么用 id 去重而不是文本去重？哪一路优先？
-**锚点**：`memory_service.py:243-250`
-- **考察意图**：对"同一实体两路命中"的理解。
+**锚点**：`memory_service.py:401-411`、`retrievers/user_memory.py:78-90`
+- **考察意图**：对"同一实体两路命中"的理解，以及"优先"这个词在融合打分下还剩多少意义。
 - **答题要点**：
-  - 同一条记忆天然会被两路同时召回（Chroma 的 id 就是 SQLite 主键的字符串形式），文本可能有细微差异（Chroma 侧存归一化后的 fact），所以必须靠 **id 判等**；`str()` 转换是为了抹平"向量路 str / 关键词路 int"的类型差（`:247`）。
-  - 顺序 `for r in vec_results + kw_results`（`:246`）→ 向量结果先入 `merged`，`seen` 只是防重，所以"向量优先"体现为**合并顺序**。
-  - **但要说清这个优先只在去重阶段有效**：紧接着 `merged.sort(key=importance, reverse=True)`（`:253`）把顺序彻底重排，向量的相关性序被抹掉。所以"向量优先、关键词兜底"这个描述**只在两条路都拿到候选时才成立**，最终谁进 top3 由 importance 决定。
+  - 同一条记忆天然会被两路同时召回（Chroma 的 id 就是 SQLite 主键的字符串形式），文本可能有细微差异（Chroma 侧存归一化后的 fact），所以必须靠 **id 判等**；`str()` 转换是为了抹平"向量路 str / 关键词路 int"的类型差（`:405`）。
+  - 顺序 `for r in vec_results + kw_results`（`:404`）→ 向量结果先入 `merged`，`seen` 只是防重，所以"向量优先"在**合并阶段**体现为插入顺序。
+  - **但"优先"的语义在 rev4 变了**：rev3 是合并后 `sort(key=importance)` 把顺序彻底重排，向量相关性序被丢掉；rev4 改为按 `score = 0.9*(1-distance) + 0.1*(importance/10)` 融合排序（`:425-434`），`distance` 第一次真正参与决策——插入顺序只在**打分完全打平时**才起 tie-break 作用。
+  - 合并之后紧接着两步过滤，共同决定"哪一路的候选能活到打分"：**主体过滤**（`:410-411`，`owner` 与提问主体不一致的直接剔除）与**遗忘过滤**（`:417-423`，衰减过度的丢弃）。
+  - 可延伸的诚实点：关键词路的 SQL 不返回 `distance`，`_score` 给它 `0.4*importance/10` 的弱分（`:429`）——关键词路候选在融合打分里**天然吃亏**，与"向量优先"的意图一致，但代价是"专名精确命中"也可能被压掉。
 
 ### Q6｜为什么要跑两路召回？各自补了什么短板？
-**锚点**：`memory_service.py:229-241`、`logs/agent.log:47`
+**锚点**：`memory_service.py:374-399`、`data/logs/agent.log:1-8`
 - **考察意图**：检索架构的设计动机。
 - **答题要点**：
-  - 语义路（`user_memory_rag.recall`，`:236`）解决同义表达："我平时喝什么饮料"→"主人喜欢喝奶茶"。
-  - 关键词路（`_recall_by_keywords`，`:241`）解决专名/精确词——bge-small-zh 是 512 维小模型，对极短 query 和生僻专名召回弱（日志实证：`"我是ZZDW"` 召回出"日文名/韩文名/英文名"三条，语义路被短查询稀释）。
-  - 成本：每轮一次 embedding 编码（CPU 上 ms~百 ms 级）+ 一次全表 `LIKE` 扫描 ×N 个关键词（`:194-200` 把每个词展开成两个 LIKE 条件）。
-  - 可质疑点：两路都只取 top3、合并最多 6 条再截 3（`:236,241,254`），**候选池太小**，没有给重排留空间。
+  - 语义路（`user_memory_rag.recall`，`:389`）解决同义表达："我平时喝什么饮料"→"主人喜欢喝奶茶"。
+  - 关键词路（`_recall_by_keywords`，`:399`）解决专名/精确词——bge-small-zh 是 512 维小模型，对极短 query 和生僻专名召回弱（日志实证：`"我是ZZDW"` 召回出"日文名/韩文名/英文名"三条，语义路被短查询稀释）。
+  - 成本：每轮一次 embedding 编码（CPU 上 ms~百 ms 级）+ 一次全表 `LIKE` 扫描 ×N 个关键词（`:312-315` 把每个词展开成两个 LIKE 条件）。
+  - 可质疑点：两路都只取 top3、合并最多 6 条再截 3（`:389,399,443`），**候选池太小**，没有给重排留空间。
 
 ### Q7｜🔥 压力题｜合并后按 `importance` 硬排，为什么这是本系统最核心的检索缺陷？
 **锚点**：`memory_service.py:374-444`（rev4 已修复）
@@ -85,11 +87,11 @@
   - 可质疑点（诚实说）：相对阈值 + 单候选倾向会让"平均召回条数"下降，是**用 recall 换 precision**；权重与阈值是经验值，缺数据支撑，记忆规模上去后要重调；`importance` 仍以 0.1 的权重参与，并非完全移除。
 
 ### Q8｜`store_memory` 里 SQLite 与 Chroma 的写入顺序能反过来吗？
-**锚点**：`memory_service.py:90-124`
+**锚点**：`memory_service.py:178-237`
 - **考察意图**：一致性设计的推理能力。
 - **答题要点**：
-  - 不能轻易反。当前顺序的前提是"SQLite 自增主键作为两库关联键"：先 `INSERT` 拿 `lastrowid`（`:111`），才能用它当 Chroma 的 `ids`（`:118`）。
-  - 反过来做，要么自己生成 UUID 与 SQLite 主键脱钩（召回时 `update_accessed(m["id"])` 就得用 UUID 反查，`main.py:180`→`memory_service.py:257-266` 全链路要改），要么在 Chroma 失败时回滚 SQLite（当前无事务）。
+  - 不能轻易反。当前顺序的前提是"SQLite 自增主键作为两库关联键"：先 `INSERT` 拿 `lastrowid`（`:214`），才能用它当 Chroma 的 `ids`（`:226-232`）。
+  - 反过来做，要么自己生成 UUID 与 SQLite 主键脱钩（召回时 `update_accessed(m["id"])` 就得用 UUID 反查，`main.py:180`→`memory_service.py:446-455` 全链路要改），要么在 Chroma 失败时回滚 SQLite（当前无事务）。
   - 现顺序的残留风险：SQLite 成功、Chroma 失败 → 记忆**只能被关键词路召回**，语义路永远看不到；无对账、无重试。可提出的方案：把双写做成"先写 SQLite 并标记 `indexed=0`，后台任务补索引"（变同步双写为最终一致）。
 
 ### Q9｜记忆注入的那句强指令有什么设计意图？有什么风险？
@@ -246,7 +248,7 @@
 - **答题要点**：
   - 用 LLM 的理由：泛化。"滚，别烦我"和"你能不能别来烦我"、"今天真开心"和"还行吧"——词典覆盖率差、反讽几乎无解。返回 `{"sentiment": float}` 是稳定的结构化输出（temp=0.3、max_tokens=100，`:87-88`）。
   - 成本：**每条用户消息 +1 次 API 调用**（叠加 ReAct 规划最多 3 次 + 生成 1 次 + 事实抽取 1 次 → 单轮最坏 6 次调用），延迟 +秒级，且这是**串行阻塞**在回复链路里的（非流式更明显）。
-  - 容错很弱：解析失败静默返回 `0.0`（`:99-103`）→ 被当成中性，情绪不动。也就是"API 抖动"会表现成"角色突然变得情绪迟钝"，无日志告警（只有 `logger.info` 记最终状态，`:152-154`）。
+  - 容错很弱：解析失败静默返回 `0.0`（`:99-103`）→ 被当成中性，情绪不动。也就是"API 抖动"会表现成"角色突然变得情绪迟钝"，无日志告警（只有 `logger.info` 记最终状态，`:161-163`）。
   - 更优方案值得说：用小模型/本地分类头替代（成本降一个数量级）；或复用同一次生成调用让模型顺带输出 sentiment（把两次调用合成一次）；或规则兜底 + LLM 只处理置信度低的样本。
 
 ### Q24｜好感度为什么是 +2 / −10 的非对称设计？
@@ -395,12 +397,12 @@
   - 更稳的方向：改用 function calling / JSON schema（DeepSeek 支持），把"解析"从正则变成模型约束——这是这个模块最值得升级的地方。
 
 ### Q39｜事实抽取的 prompt 里为什么要显式"禁止提取天气/新闻/股价"？
-**锚点**：`memory_service.py:46-55, 57-65`
+**锚点**：`memory_service.py:59-93`
 - **考察意图**：数据治理意识，以及"用 prompt 做治理"的边界。
 - **答题要点**：
   - 动机：长期事实记忆与时效信息必须分开。不写这条约束，模型会把"今天上海 25 度""股市涨了"当用户事实存进永久库，一周后污染回复。rev4 虽已加入遗忘机制（时效标记软删除，见 Q11），但**天气/实时信息未必带"以前/上周"这类时效词**，仍必须靠这条 prompt 约束在写入侧拦掉——两层防护，不能只靠遗忘。
-  - 其他约束也在同一个 prompt 里：最多 3 条、每条 ≤50 字（`:52`）、importance 由模型自评（喜好/雷点 8-10、闲聊 3-5，`:50`）、要求纯 JSON 且防 markdown 包裹（`:69-71` 三重 `removeprefix/removesuffix`）。
-  - 局限：**全靠模型自觉**。没有 schema 校验（只判 `isinstance(facts, list)`，`:73-78`；解析失败直接返回 `[]`，静默丢一轮）、没有字段级校验（缺 `fact` 键会在 `main.py:208` 的 `f["fact"]` 处抛 KeyError → 非流式直接 500，见 Q35）、没有写入前的规则过滤。
+  - 其他约束也在同一个 prompt 里：最多 3 条、每条 ≤50 字（`:67`）、importance 由模型自评（喜好/雷点 8-10、闲聊 3-5，`:65`）、要求纯 JSON 且防 markdown 包裹（`:84-86` 三重 `removeprefix/removesuffix`）。
+  - 局限：**全靠模型自觉**。没有 schema 校验（只判 `isinstance(facts, list)`，`:88-93`；解析失败直接返回 `[]`，静默丢一轮）、没有字段级校验（缺 `fact` 键会在 `main.py:208` 的 `f["fact"]` 处抛 KeyError → 非流式直接 500，见 Q35）、没有写入前的规则过滤。
   - **实测反例（很有说服力的素材）**：`logs/agent.log:47` 记录召回到 `fact=助手是蓝色头发，不是粉色` —— **"助手是自己"的属性被当成"关于用户的事实"存了下来**。说明 prompt 约束不足以控制抽取粒度，这也是 `tests/eval` 里 `extract_facts` 未被覆盖（Q20）的真正风险点。
   - 建议：加 `fact_type` 字段（preference / life_event / role_attribute / ephemeral）+ 写入前规则过滤（含"助手/希格雯/我"主语的可疑条目拦截）+ 结构化输出校验。
 
