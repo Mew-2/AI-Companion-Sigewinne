@@ -31,6 +31,7 @@ class UserMemoryRAG:
         keywords: list,
         importance: int = 5,
         source: str = "dialogue",
+        owner: str = "主人",
     ) -> None:
         """写入单条记忆"""
         self.collection.add(
@@ -42,6 +43,7 @@ class UserMemoryRAG:
                     "importance": importance,
                     "created_at": datetime.now().isoformat(),
                     "source": source,
+                    "owner": owner,
                 }
             ],
         )
@@ -73,6 +75,7 @@ class UserMemoryRAG:
                     "fact": results["documents"][0][i],
                     "keywords": kw,
                     "importance": meta.get("importance", 5),
+                    "owner": meta.get("owner", "主人"),
                     "created_at": meta.get("created_at", ""),
                     "distance": (
                         results["distances"][0][i] if results.get("distances") else None

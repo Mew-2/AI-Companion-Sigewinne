@@ -24,7 +24,7 @@ DB_PATH = "chat.db"
 
 
 def init_db():
-    """创建 memories 表（安全，重复执行不会报错）"""
+    """创建 memories 表（安全，重复执行不会报错），并把旧库迁移出 owner 列。"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""
@@ -33,10 +33,16 @@ def init_db():
             fact TEXT NOT NULL,
             keywords TEXT NOT NULL,
             importance INTEGER DEFAULT 5 CHECK(importance BETWEEN 1 AND 10),
+            owner TEXT DEFAULT '主人',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             last_accessed TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    # 迁移：旧库（无 owner 列）补列，历史记忆默认归属"主人"
+    cols = {row[1] for row in c.execute("PRAGMA table_info(memories)")}
+    if "owner" not in cols:
+        c.execute("ALTER TABLE memories ADD COLUMN owner TEXT DEFAULT '主人'")
+        logger.info("[UserMemory] 迁移：memories 表新增 owner 列，历史记忆默认 owner=主人")
     conn.commit()
     conn.close()
 
@@ -83,9 +89,34 @@ def _normalize_fact(text: str) -> str:
     return text.rstrip("。！？，,.!?;；:： \t\n")
 
 
-def store_memory(fact: str, keywords: list, importance: int = 5):
-    """SQLite + ChromaDB 双写"""
+# 他人关系词：用于区分"关于主人自己的记忆"与"关于他人（同事/朋友/家人）的记忆"
+_RELATION_WORDS = (
+    "同事|朋友|邻居|室友|同学|老师|医生|领导|老板|上司|"
+    "妹妹|弟弟|哥哥|姐姐|表弟|表妹|表哥|表姐|"
+    "父母|爸爸|妈妈|父亲|母亲|爷爷|奶奶|外公|外婆|"
+    "男友|女友|老公|老婆|丈夫|妻子|儿子|女儿|孩子|亲戚"
+)
+# "主人的<关系词>" / "主人家的<关系词>" → 该条记忆的主体是他人
+_OWNER_OTHER_RE = re.compile(rf"^主人(?:的|家的)\s*(?:{_RELATION_WORDS})")
+# 提问主体："我的<关系词>" → 问的是他人；否则默认问主人自己
+_QUERY_OTHER_RE = re.compile(rf"我(?:的|家)?\s*(?:{_RELATION_WORDS})")
+
+
+def _infer_owner(fact: str) -> str:
+    """从事实文本推断主体：默认"主人"，形如"主人的同事…"判为"他人"。"""
+    return "他人" if _OWNER_OTHER_RE.match(fact.strip()) else "主人"
+
+
+def _infer_query_owner(query: str) -> str:
+    """从提问推断主体：默认"主人"，形如"我同事…"判为"他人"。"""
+    return "他人" if _QUERY_OTHER_RE.search(query) else "主人"
+
+
+def store_memory(fact: str, keywords: list, importance: int = 5, owner: str | None = None):
+    """SQLite + ChromaDB 双写。owner 缺省时按事实文本自动推断（主人/他人）。"""
     fact = _normalize_fact(fact)
+    if owner is None:
+        owner = _infer_owner(fact)
 
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -98,12 +129,13 @@ def store_memory(fact: str, keywords: list, importance: int = 5):
             return
 
     c.execute(
-        """INSERT INTO memories (fact, keywords, importance, created_at, last_accessed)
-           VALUES (?, ?, ?, ?, ?)""",
+        """INSERT INTO memories (fact, keywords, importance, owner, created_at, last_accessed)
+           VALUES (?, ?, ?, ?, ?, ?)""",
         (
             fact,
             json.dumps(keywords, ensure_ascii=False),
             importance,
+            owner,
             datetime.now(),
             datetime.now(),
         ),
@@ -119,6 +151,7 @@ def store_memory(fact: str, keywords: list, importance: int = 5):
             fact=fact,
             keywords=keywords,
             importance=importance,
+            owner=owner,
         )
     except Exception as e:
         logger.error(f"[UserMemory] 向量写入失败: {e}")
@@ -201,7 +234,7 @@ def _recall_by_keywords(query: str, top_k: int = 5) -> list[dict]:
 
     c.execute(
         f"""
-        SELECT id, fact, keywords, importance, created_at, last_accessed
+        SELECT id, fact, keywords, importance, owner, created_at, last_accessed
         FROM memories
         WHERE {conditions}
         ORDER BY importance DESC, last_accessed DESC
@@ -219,17 +252,22 @@ def _recall_by_keywords(query: str, top_k: int = 5) -> list[dict]:
             "fact": r[1],
             "keywords": json.loads(r[2]) if r[2] else [],
             "importance": r[3],
-            "created_at": r[4],
-            "last_accessed": r[5],
+            "owner": r[4] or "主人",
+            "created_at": r[5],
+            "last_accessed": r[6],
         }
         for r in rows
     ]
 
 
-def recall_memories(query: str, top_k: int = 5) -> list[dict]:
+def recall_memories(query: str, top_k: int = 5, owner: str | None = None) -> list[dict]:
     """
-    混合召回：ChromaDB 语义召回（优先） + jieba 关键词召回（兜底）
+    混合召回：ChromaDB 语义召回（优先） + jieba 关键词召回（兜底）。
+    owner 缺省时按提问推断主体，只保留同一主体的记忆（隔离"同事/朋友"等他人事实）。
     """
+    if owner is None:
+        owner = _infer_query_owner(query)
+
     # === 1. 向量语义召回 ===
     vec_results = []
     try:
@@ -248,6 +286,9 @@ def recall_memories(query: str, top_k: int = 5) -> list[dict]:
         if mid and mid not in seen:
             seen.add(mid)
             merged.append(r)
+
+    # === 4. 主体过滤：只保留与提问主体一致的记忆 ===
+    merged = [r for r in merged if (r.get("owner") or "主人") == owner]
 
     # 按 importance 降序，取 top_k
     merged.sort(key=lambda x: x.get("importance", 0), reverse=True)

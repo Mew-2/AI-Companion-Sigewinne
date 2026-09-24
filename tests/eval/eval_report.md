@@ -1,8 +1,8 @@
 # 记忆召回评测报告
 
-> 生成时间：2026-09-24 18:33:15｜用例集：`memory_recall_cases.json`（sha256:a0c9dc6d7d89）
+> 生成时间：2026-09-24 18:37:04｜用例集：`memory_recall_cases.json`（sha256:a0c9dc6d7d89）
 > 召回 top_k：3（与 main.py:173 `recall_memories(msg, top_k=3)` 一致）
-> 总耗时：37.5s｜token 计量：tiktoken cl100k_base（近似 DeepSeek 分词）
+> 总耗时：30.5s｜token 计量：tiktoken cl100k_base（近似 DeepSeek 分词）
 > 召回后端：ChromaDB + `BAAI/bge-small-zh-v1.5`（真实向量检索）
 
 **评测范围**：只覆盖检索层（`store_memory` 写入 + `recall_memories` 召回 + importance 排序截断）。
@@ -14,16 +14,16 @@
 | 指标 | 值 |
 |---|---|
 | 用例总数 | 120 |
-| 通过 | 73 |
-| **总准确率** | **60.8%** |
-| 平均召回延迟 | 15.4 ms |
-| 中位召回延迟 | 15.3 ms |
-| P95 召回延迟 | 18.3 ms |
-| 最大召回延迟 | 21.1 ms |
-| 平均每用例写入耗时 | 279.7 ms（写入 1137 条） |
-| **平均单条记忆写入延迟** | **29.5 ms** |
-| 平均召回条数 | 2.73 |
-| **平均注入 token** | **50.7**（中位 53.5） |
+| 通过 | 92 |
+| **总准确率** | **76.7%** |
+| 平均召回延迟 | 12.7 ms |
+| 中位召回延迟 | 12.6 ms |
+| P95 召回延迟 | 14.5 ms |
+| 最大召回延迟 | 15.9 ms |
+| 平均每用例写入耗时 | 228.5 ms（写入 1137 条） |
+| **平均单条记忆写入延迟** | **24.1 ms** |
+| 平均召回条数 | 2.57 |
+| **平均注入 token** | **47.7**（中位 52.0） |
 
 > token 指召回结果被拼进 System Prompt 的那段文本的 token 数（`main.py:163-166` 的 `memory_text`），
 > 召回层自身不调 LLM，因此没有 API token 消耗；这个数字衡量的是**每轮对话被记忆占用的上下文成本**。
@@ -35,7 +35,7 @@
 | 事实记忆 `fact_recall` | 24 | 24 | 100.0% |
 | 多轮上下文依赖 `long_context` | 24 | 24 | 100.0% |
 | 情感记忆 `emotion_memory` | 24 | 24 | 100.0% |
-| 干扰项 `distractor` | 24 | 1 | 4.2% |
+| 干扰项 `distractor` | 24 | 20 | 83.3% |
 | 遗忘验证 `forgetting` | 24 | 0 | 0.0% |
 
 ### 按难度
@@ -43,38 +43,13 @@
 | 难度 | 用例数 | 通过 | 准确率 |
 |---|---|---|---|
 | easy | 16 | 16 | 100.0% |
-| hard | 52 | 28 | 53.8% |
-| medium | 52 | 29 | 55.8% |
+| hard | 52 | 38 | 73.1% |
+| medium | 52 | 38 | 73.1% |
 
 ## 3. 失败案例明细
 
-### 干扰项（23/24 失败）
+### 干扰项（4/24 失败）
 
-- **`distract_001`** · medium · 写入 6 条
-  - query：`我最喜欢喝的是什么饮料？`
-  - 期望：should_recall=True，match_any=['奶茶']，must_not_match=['咖啡']
-  - 实召：主人喜欢喝奶茶，尤其是珍珠奶茶；主人的同事小李喜欢喝美式咖啡；主人提到午饭吃的是楼下的黄焖鸡
-  - 判定：hit_any=True，hit_bad=True
-- **`distract_002`** · hard · 写入 10 条
-  - query：`我自己养的是什么宠物？`
-  - 期望：should_recall=True，match_any=['橘猫']，must_not_match=['狗']
-  - 实召：主人家里养了一只橘猫叫豆豆；主人的邻居家养了一条金毛狗；主人提到同事拿了一箱橘子分给大家
-  - 判定：hit_any=True，hit_bad=True
-- **`distract_003`** · medium · 写入 6 条
-  - query：`我固定做什么运动？`
-  - 期望：should_recall=True，match_any=['羽毛球']，must_not_match=['篮球']
-  - 实召：主人每周三晚上去打羽毛球；主人的同事每周五去打篮球；主人提到最近在整理以前的旧照片
-  - 判定：hit_any=True，hit_bad=True
-- **`distract_004`** · hard · 写入 10 条
-  - query：`我最喜欢哪个歌手？`
-  - 期望：should_recall=True，match_any=['周杰伦']，must_not_match=['林俊杰']
-  - 实召：主人最喜欢周杰伦的歌；主人的朋友很喜欢林俊杰的歌；主人提到最近在学做番茄炒蛋
-  - 判定：hit_any=True，hit_bad=True
-- **`distract_005`** · medium · 写入 6 条
-  - query：`我平时玩哪个游戏？`
-  - 期望：should_recall=True，match_any=['原神']，must_not_match=['崩坏']
-  - 实召：主人喜欢玩原神；主人的室友在玩崩坏三；主人提到最近在学做番茄炒蛋
-  - 判定：hit_any=True，hit_bad=True
 - **`distract_006`** · hard · 写入 10 条
   - query：`我最喜欢的颜色是哪一个？`
   - 期望：should_recall=True，match_any=['深蓝色']，must_not_match=['墨绿色']
@@ -85,85 +60,15 @@
   - 期望：should_recall=True，match_any=['秋天']，must_not_match=['春天']
   - 实召：主人最喜欢秋天；主人说过春天也挺舒服；主人提到最近想学吉他
   - 判定：hit_any=True，hit_bad=True
-- **`distract_008`** · hard · 写入 10 条
-  - query：`我最爱看哪个类型的电影？`
-  - 期望：should_recall=True，match_any=['科幻']，must_not_match=['悬疑']
-  - 实召：主人喜欢看科幻电影；主人的同事喜欢看悬疑电影；主人说最近在补一部很老的老剧
-  - 判定：hit_any=True，hit_bad=True
-- **`distract_009`** · medium · 写入 6 条
-  - query：`过敏的是什么东西？`
-  - 期望：should_recall=True，match_any=['过敏']，must_not_match=['芒果']
-  - 实召：主人对海鲜过敏，尤其不能吃虾；主人的妹妹对芒果过敏；主人说今天早高峰堵了半小时
-  - 判定：hit_any=True，hit_bad=True
-- **`distract_010`** · hard · 写入 10 条
-  - query：`我自己用的是什么手机？`
-  - 期望：should_recall=True，match_any=['安卓']，must_not_match=['苹果']
-  - 实召：主人用的是安卓手机；主人的妹妹用的是苹果手机；主人说今天收到的快递是坏的
-  - 判定：hit_any=True，hit_bad=True
-- **`distract_011`** · medium · 写入 6 条
-  - query：`我每天怎么去上班？`
-  - 期望：should_recall=True，match_any=['开车']，must_not_match=['地铁']
-  - 实召：主人自己开车上班；主人的同事每天坐地铁上班；主人提到周末打算去趟超市囤点东西
-  - 判定：hit_any=True，hit_bad=True
-- **`distract_012`** · hard · 写入 10 条
-  - query：`我家里有哪些兄弟姐妹？`
-  - 期望：should_recall=True，match_any=['妹妹']，must_not_match=['表弟']
-  - 实召：主人有个妹妹在读高中；主人的表弟在读大学；主人说周末打算在家躺一整天
-  - 判定：hit_any=True，hit_bad=True
-- **`distract_013`** · medium · 写入 6 条
-  - query：`我是哪个大学毕业的？`
-  - 期望：should_recall=True，match_any=['南京航空航天大学']，must_not_match=['南京大学']
-  - 实召：主人毕业于南京航空航天大学；主人的朋友毕业于南京大学；主人今天提到公司楼下新开了一家咖啡店
-  - 判定：hit_any=True，hit_bad=True
 - **`distract_014`** · hard · 写入 10 条
   - query：`我最喜欢去哪里旅行？`
   - 期望：should_recall=True，match_any=['海边']，must_not_match=['草原']
   - 实召：主人喜欢去海边旅行；主人说过想去草原看看；主人说最近地铁在施工，通勤要绕路
   - 判定：hit_any=True，hit_bad=True
-- **`distract_016`** · hard · 写入 10 条
-  - query：`我自己的口味是什么样的？`
-  - 期望：should_recall=True，match_any=['辣']，must_not_match=['无辣不欢']
-  - 实召：主人吃不了太辣的东西；主人的朋友无辣不欢；主人提到午饭吃的是楼下的黄焖鸡
-  - 判定：hit_any=True，hit_bad=True
-- **`distract_017`** · medium · 写入 6 条
-  - query：`我希望别人怎么称呼我？`
-  - 期望：should_recall=True，match_any=['ZZDW']，must_not_match=['老王']
-  - 实召：主人希望被称呼为 ZZDW；主人的同事希望大家叫他老王；主人提到同事拿了一箱橘子分给大家
-  - 判定：hit_any=True，hit_bad=True
-- **`distract_018`** · hard · 写入 10 条
-  - query：`我自己的职业是什么？`
-  - 期望：should_recall=True，match_any=['空管']，must_not_match=['前端']
-  - 实召：主人是做空管系统开发的后端程序员；主人的朋友是做前端开发的；主人提到最近在学做番茄炒蛋
-  - 判定：hit_any=True，hit_bad=True
-- **`distract_019`** · medium · 写入 6 条
-  - query：`我现在住在哪里？`
-  - 期望：should_recall=True，match_any=['南通']，must_not_match=['苏州']
-  - 实召：主人目前住在江苏南通；主人的父母住在苏州；主人提到最近在整理以前的旧照片
-  - 判定：hit_any=True，hit_bad=True
-- **`distract_020`** · hard · 写入 10 条
-  - query：`我家猫叫什么名字？`
-  - 期望：should_recall=True，match_any=['豆豆']，must_not_match=['咪咪']
-  - 实召：主人养的橘猫叫豆豆；主人的朋友家的猫叫咪咪；主人提到最近想学吉他
-  - 判定：hit_any=True，hit_bad=True
 - **`distract_021`** · medium · 写入 6 条
   - query：`我下午喝咖啡会有什么后果？`
   - 期望：should_recall=True，match_any=['失眠']，must_not_match=['早上']
   - 实召：主人下午喝咖啡会失眠；主人早上的咖啡完全不影响睡眠；主人说今天下雨但是没带伞
-  - 判定：hit_any=True，hit_bad=True
-- **`distract_022`** · hard · 写入 10 条
-  - query：`我最喜欢看哪本书？`
-  - 期望：should_recall=True，match_any=['三体']，must_not_match=['活着']
-  - 实召：主人最喜欢的书是《三体》；主人的同事最爱看《活着》；主人提到最近想学吉他
-  - 判定：hit_any=True，hit_bad=True
-- **`distract_023`** · medium · 写入 6 条
-  - query：`我自己对香菜是什么态度？`
-  - 期望：should_recall=True，match_any=['香菜']，must_not_match=['妹妹']
-  - 实召：主人讨厌吃香菜；主人的妹妹特别爱吃香菜；主人说昨天和朋友去吃了烧烤
-  - 判定：hit_any=True，hit_bad=True
-- **`distract_024`** · hard · 写入 10 条
-  - query：`我平时喜欢看什么类型的动漫？`
-  - 期望：should_recall=True，match_any=['治愈']，must_not_match=['热血']
-  - 实召：主人喜欢看治愈系动漫；主人的朋友只看热血番；主人提到在阳台种了几株小番茄
   - 判定：hit_any=True，hit_bad=True
 
 ### 遗忘验证（24/24 失败）
@@ -294,7 +199,7 @@
 | 失败模式 | 条数 |
 |---|---|
 | 应遗忘却仍被召回（无遗忘机制） | 24 |
-| 干扰项混入（应排除的记忆进了 top_k） | 23 |
+| 干扰项混入（应排除的记忆进了 top_k） | 4 |
 
 ## 5. 结论与缺口
 
@@ -302,11 +207,11 @@
   项目没有任何遗忘/衰减/覆盖机制：`user_memory.delete()`（`user_memory.py:92-93`）定义后无调用者，
   `min_importance` 恒传 1（`memory_service.py:236`）等于不过滤，`importance` 只用于排序（`:253`）。
   本类断言的是「已过期/已被更正的信息不应被想起来」——这是产品缺口，不是回归。
-- **干扰项 4.2%**：相似但无关的记忆混入 top_k。
+- **干扰项 83.3%**：相似但无关的记忆混入 top_k。
   根因是 `recall_memories` 取满 top_k 且**无相关性阈值**（`memory_service.py:236` 传 `min_importance=1`，
   `user_memory.py:52-54` 因此不构造 where 过滤），distance 只记录不参与决策（`user_memory.py:77-79`）。
-- 平均每轮注入 51 token 的记忆上下文；
-  召回延迟 P95 18ms，相对一次 LLM 调用（秒级）可忽略，**延迟不是瓶颈**。
+- 平均每轮注入 48 token 的记忆上下文；
+  召回延迟 P95 14ms，相对一次 LLM 调用（秒级）可忽略，**延迟不是瓶颈**。
 
 > 完整失败清单见上；每条用例的判定依据只取决于 `recall_memories` 的返回，
 > 不涉及主观打分，任何人重跑本脚本都应得到同样的通过/失败集合（检索层无随机性）。
