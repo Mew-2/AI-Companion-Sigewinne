@@ -1,5 +1,6 @@
 import os
 import json
+import math
 import sqlite3
 import jieba
 from retrievers.user_memory import UserMemoryRAG
@@ -24,7 +25,7 @@ DB_PATH = "chat.db"
 
 
 def init_db():
-    """创建 memories 表（安全，重复执行不会报错），并把旧库迁移出 owner 列。"""
+    """创建 memories 表（安全，重复执行不会报错），并把旧库迁移出 owner/status/access_count 列。"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""
@@ -34,15 +35,23 @@ def init_db():
             keywords TEXT NOT NULL,
             importance INTEGER DEFAULT 5 CHECK(importance BETWEEN 1 AND 10),
             owner TEXT DEFAULT '主人',
+            status TEXT DEFAULT 'active',
+            access_count INTEGER DEFAULT 0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             last_accessed TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    # 迁移：旧库（无 owner 列）补列，历史记忆默认归属"主人"
+    # 迁移：旧库补列
     cols = {row[1] for row in c.execute("PRAGMA table_info(memories)")}
     if "owner" not in cols:
         c.execute("ALTER TABLE memories ADD COLUMN owner TEXT DEFAULT '主人'")
         logger.info("[UserMemory] 迁移：memories 表新增 owner 列，历史记忆默认 owner=主人")
+    if "status" not in cols:
+        c.execute("ALTER TABLE memories ADD COLUMN status TEXT DEFAULT 'active'")
+        logger.info("[UserMemory] 迁移：memories 表新增 status 列，历史记忆默认 status=active")
+    if "access_count" not in cols:
+        c.execute("ALTER TABLE memories ADD COLUMN access_count INTEGER DEFAULT 0")
+        logger.info("[UserMemory] 迁移：memories 表新增 access_count 列")
     conn.commit()
     conn.close()
 
@@ -112,11 +121,71 @@ def _infer_query_owner(query: str) -> str:
     return "他人" if _QUERY_OTHER_RE.search(query) else "主人"
 
 
+# 时效标记：命中即视为"已过期/情景性"记忆，写入即失效（软删除，不参与召回）
+_STALE_MARKERS = (
+    "以前", "之前", "曾经", "去年", "上个月", "上周", "上周末",
+    "昨天", "前天", "过去", "当年", "那时候",
+)
+# 现状/变更标记：命中表示"当前有效的新事实"，可与同主题旧记忆冲突覆盖
+_CURRENT_MARKERS = (
+    "已经", "现在", "如今", "目前", "成功", "换成", "搬到",
+    "转岗", "戒了", "买好", "决定不", "改成",
+)
+
+
+def _is_expired_fact(fact: str) -> bool:
+    """含过去时效标记的事实 = 已被覆盖/已过去的情景，标记为过期。"""
+    return any(m in fact for m in _STALE_MARKERS)
+
+
+def _has_current_marker(fact: str) -> bool:
+    return any(m in fact for m in _CURRENT_MARKERS)
+
+
+def _supersede_conflicts(new_id: int, fact: str, keywords: list, owner: str) -> int:
+    """冲突覆盖：新事实带"现状"标记且与同主体旧记忆共享关键词时，
+    旧记忆置为 superseded 并撤出向量库（软删除）。"""
+    if not _has_current_marker(fact):
+        return 0
+    new_kw = set(keywords or [])
+    if not new_kw:
+        return 0
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    superseded = 0
+    rows = c.execute(
+        "SELECT id, keywords FROM memories WHERE status='active' AND owner=? AND id<>?",
+        (owner, new_id),
+    ).fetchall()
+    for rid, rkw in rows:
+        try:
+            old_kw = set(json.loads(rkw) if rkw else [])
+        except Exception:
+            old_kw = set()
+        if new_kw & old_kw:
+            c.execute("UPDATE memories SET status='superseded' WHERE id=?", (rid,))
+            try:
+                user_memory_rag.delete(str(rid))
+            except Exception as e:
+                logger.error(f"[UserMemory] 冲突覆盖删除向量失败 id={rid}: {e}")
+            logger.info(f"[UserMemory] 冲突覆盖：旧记忆 id={rid} 被新记忆 id={new_id} 取代")
+            superseded += 1
+    conn.commit()
+    conn.close()
+    return superseded
+
+
 def store_memory(fact: str, keywords: list, importance: int = 5, owner: str | None = None):
-    """SQLite + ChromaDB 双写。owner 缺省时按事实文本自动推断（主人/他人）。"""
+    """SQLite + ChromaDB 双写。
+
+    - owner 缺省时按事实文本自动推断（主人/他人）。
+    - 命中时效标记（以前/上周/昨天…）的事实写入即标记 expired（软删除，不入向量库）。
+    - 带"现状"标记且与同主体旧记忆共享关键词时，旧记忆被冲突覆盖（superseded）。
+    """
     fact = _normalize_fact(fact)
     if owner is None:
         owner = _infer_owner(fact)
+    status = "expired" if _is_expired_fact(fact) else "active"
 
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -129,13 +198,15 @@ def store_memory(fact: str, keywords: list, importance: int = 5, owner: str | No
             return
 
     c.execute(
-        """INSERT INTO memories (fact, keywords, importance, owner, created_at, last_accessed)
-           VALUES (?, ?, ?, ?, ?, ?)""",
+        """INSERT INTO memories
+           (fact, keywords, importance, owner, status, access_count, created_at, last_accessed)
+           VALUES (?, ?, ?, ?, ?, 0, ?, ?)""",
         (
             fact,
             json.dumps(keywords, ensure_ascii=False),
             importance,
             owner,
+            status,
             datetime.now(),
             datetime.now(),
         ),
@@ -143,6 +214,12 @@ def store_memory(fact: str, keywords: list, importance: int = 5, owner: str | No
     memory_id = c.lastrowid
     conn.commit()
     conn.close()
+
+    if status == "expired":
+        logger.info(
+            f"[UserMemory] 时效标记命中，写入即失效（软删除，不入向量库）: {fact[:30]}..."
+        )
+        return
 
     # 同步写入 ChromaDB 向量库
     try:
@@ -155,6 +232,9 @@ def store_memory(fact: str, keywords: list, importance: int = 5, owner: str | No
         )
     except Exception as e:
         logger.error(f"[UserMemory] 向量写入失败: {e}")
+
+    # 冲突覆盖：新现状事实取代同主题旧事实
+    _supersede_conflicts(memory_id, fact, keywords, owner)
 
 
 # 停用词：过滤无意义词，提高召回精度
@@ -236,9 +316,9 @@ def _recall_by_keywords(query: str, top_k: int = 5) -> list[dict]:
 
     c.execute(
         f"""
-        SELECT id, fact, keywords, importance, owner, created_at, last_accessed
+        SELECT id, fact, keywords, importance, owner, access_count, created_at, last_accessed
         FROM memories
-        WHERE {conditions}
+        WHERE ({conditions}) AND status='active'
         ORDER BY importance DESC, last_accessed DESC
         LIMIT ?
     """,
@@ -255,19 +335,40 @@ def _recall_by_keywords(query: str, top_k: int = 5) -> list[dict]:
             "keywords": json.loads(r[2]) if r[2] else [],
             "importance": r[3],
             "owner": r[4] or "主人",
-            "created_at": r[5],
-            "last_accessed": r[6],
+            "access_count": r[5] or 0,
+            "created_at": r[6],
+            "last_accessed": r[7],
         }
         for r in rows
     ]
 
 
-# 召回参数（重构：相关性阈值 + 融合重排）
+# 召回参数（重构：相关性阈值 + 融合重排 + 遗忘）
 RECALL_CANDIDATE_K = 15      # 候选池大小（供过滤/重排）
 RECALL_MAX_DISTANCE = 0.8    # 绝对阈值：cosine 距离超过即丢弃
 RECALL_SCORE_MARGIN = 0.08   # 相对阈值：只保留与最佳结果分数差在 margin 内的记忆
 RECALL_W_DISTANCE = 0.9      # 融合打分权重：distance 为主
 RECALL_W_IMPORTANCE = 0.1    # importance 为辅
+RECALL_DECAY_LAMBDA = 0.05   # 时间衰减：每天按 e^-0.05 降权
+RECALL_MIN_RECENCY = 0.05    # 衰减因子低于此值视为过期，不再召回
+
+
+def _recency_factor(m: dict) -> float:
+    """遗忘因子 = 时间衰减 × 访问频率加成。
+
+    - 越久未访问，decay 越小（exp(-λ·天数)）。
+    - 被访问次数越多，freq 越大（1+ln(1+access_count)）——热点记忆不易被遗忘。
+    """
+    ts = m.get("last_accessed") or m.get("created_at")
+    days = 0.0
+    if ts:
+        try:
+            days = max(0.0, (datetime.now() - datetime.fromisoformat(str(ts))).total_seconds() / 86400)
+        except (ValueError, TypeError):
+            days = 0.0
+    decay = math.exp(-RECALL_DECAY_LAMBDA * days)
+    freq = 1.0 + math.log1p(int(m.get("access_count") or 0))
+    return decay * freq
 
 
 def recall_memories(query: str, top_k: int = 5, owner: str | None = None) -> list[dict]:
@@ -313,19 +414,26 @@ def recall_memories(query: str, top_k: int = 5, owner: str | None = None) -> lis
         logger.info("[UserMemory] 无候选记忆（语义路与关键词路均为空）")
         return []
 
-    # === 5. 融合打分：distance 为主、importance 为辅 ===
+    # === 5. 遗忘：时间衰减 × 访问频率，衰减过度的记忆视为过期 ===
+    for m in merged:
+        m["_recency"] = _recency_factor(m)
+    merged = [m for m in merged if m["_recency"] >= RECALL_MIN_RECENCY]
+    if not merged:
+        logger.info("[UserMemory] 候选记忆均已衰减过期，显式返回空")
+        return []
+
+    # === 6. 融合打分：distance 为主、importance 为辅，再乘遗忘因子 ===
     def _score(m: dict) -> float:
         imp = m.get("importance", 0) / 10.0
         d = m.get("distance")
-        if d is None:  # 关键词路无距离信号，只给弱分
-            return 0.4 * imp
-        return RECALL_W_DISTANCE * (1.0 - d) + RECALL_W_IMPORTANCE * imp
+        base = 0.4 * imp if d is None else RECALL_W_DISTANCE * (1.0 - d) + RECALL_W_IMPORTANCE * imp
+        return base * m["_recency"]
 
     for m in merged:
         m["_score"] = _score(m)
     merged.sort(key=lambda x: x["_score"], reverse=True)
 
-    # === 6. 相对相关性阈值：只保留与最佳结果同档的记忆 ===
+    # === 7. 相对相关性阈值：只保留与最佳结果同档的记忆 ===
     best = merged[0]["_score"]
     kept = [m for m in merged if m["_score"] >= best - RECALL_SCORE_MARGIN]
     if not kept:
@@ -336,11 +444,11 @@ def recall_memories(query: str, top_k: int = 5, owner: str | None = None) -> lis
 
 
 def update_accessed(memory_id: int):
-    """更新最后访问时间（召回后调用）"""
+    """更新最后访问时间并累加访问次数（召回后调用，供遗忘频率因子使用）"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute(
-        "UPDATE memories SET last_accessed = ? WHERE id = ?",
+        "UPDATE memories SET last_accessed = ?, access_count = COALESCE(access_count, 0) + 1 WHERE id = ?",
         (datetime.now(), memory_id),
     )
     conn.commit()
