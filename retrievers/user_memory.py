@@ -31,6 +31,7 @@ class UserMemoryRAG:
         keywords: list,
         importance: int = 5,
         source: str = "dialogue",
+        owner: str = "主人",
     ) -> None:
         """写入单条记忆"""
         self.collection.add(
@@ -42,13 +43,20 @@ class UserMemoryRAG:
                     "importance": importance,
                     "created_at": datetime.now().isoformat(),
                     "source": source,
+                    "owner": owner,
                 }
             ],
         )
         logger.info(f"[UserMemory] 写入 id={memory_id}, fact={fact[:30]}...")
 
-    def recall(self, query: str, top_k: int = 5, min_importance: int = 1) -> list[dict]:
-        """语义召回"""
+    def recall(
+        self,
+        query: str,
+        top_k: int = 5,
+        min_importance: int = 1,
+        max_distance: float | None = None,
+    ) -> list[dict]:
+        """语义召回。max_distance 非空时丢弃距离超过阈值的弱相关结果。"""
         where_clause = (
             {"importance": {"$gte": min_importance}} if min_importance > 1 else None
         )
@@ -73,12 +81,31 @@ class UserMemoryRAG:
                     "fact": results["documents"][0][i],
                     "keywords": kw,
                     "importance": meta.get("importance", 5),
+                    "owner": meta.get("owner", "主人"),
+                    # access_count/last_accessed 在 Chroma 里没有权威值，
+                    # 这里先占位，由 memory_service.recall_memories 从 SQLite 回填权威值。
+                    "access_count": meta.get("access_count", 0),
                     "created_at": meta.get("created_at", ""),
+                    "last_accessed": meta.get("last_accessed", ""),
                     "distance": (
                         results["distances"][0][i] if results.get("distances") else None
                     ),
                 }
             )
+
+        # 相关性阈值：距离越大越不相关，超过阈值直接丢弃
+        if max_distance is not None:
+            kept = [
+                m
+                for m in memories
+                if m.get("distance") is None or m["distance"] <= max_distance
+            ]
+            dropped = len(memories) - len(kept)
+            if dropped:
+                logger.info(
+                    f"[UserMemory] 阈值过滤：丢弃 {dropped} 条 distance>{max_distance}"
+                )
+            memories = kept
 
         logger.info(f"[UserMemory] 召回 {len(memories)} 条, query={query[:20]}...")
 

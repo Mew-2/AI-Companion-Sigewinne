@@ -142,7 +142,16 @@ class PersonalityState:
             self.emotion = "angry"
             self.momentum = max(self.momentum + 1, 3)  # 生气有惯性，至少3轮
         elif self.affinity < -10:
-            self.emotion = "sad"
+            # sad 也有惯性：进入时给 2 轮，之后每轮递减，减到 0 回落 normal。
+            # （修复死锁：旧实现 sad 分支既不清零也不递减 momentum，
+            #   导致 angry 平复到 sad 后，只要 affinity 没回到 -10 以上就永远卡在 sad。）
+            if self.emotion != "sad":
+                self.emotion = "sad"
+                self.momentum = max(self.momentum, 2)
+            else:
+                self.momentum = max(0, self.momentum - 1)
+                if self.momentum == 0:
+                    self.emotion = "normal"
         else:
             # 慢慢平复
             self.momentum = max(0, self.momentum - 1)
