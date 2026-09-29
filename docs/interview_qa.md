@@ -514,9 +514,9 @@
 **锚点**：`tests/`、`main.py:28-50`、`logs/agent.log`
 - **考察意图**：工程成熟度自评——"你现在能证明什么、证明不了什么"。
 - **答题要点**：
-  - **测试现状**：共 **19 个用例**，分五组——`tests/test_chat.py` 3 个（GET/POST 正常 + 空消息 422）、`tests/test_response_contract.py` 4 个（走工具/不走工具/流式 meta 形状/降级流带键）、`tests/test_memory_owner.py` 5 个（主体推断 + 按主体过滤召回）、`tests/test_memory_forgetting.py` 4 个（时效软删除 / 冲突覆盖 / 召回排除过期，隔离到 tmp DB + 假向量库）、`tests/test_personality.py` 3 个（sad 死锁回归 / 怒气惯性 / happy 阈值）。全部 mock 或无外部副作用（不写生产库、不打外部 API、不烧额度）。运行必须带 `HF_HUB_OFFLINE=1`（否则 sentence-transformers 去 HuggingFace 拉模型元数据）。
+  - **测试现状**：共 **21 个用例**，分六组——`tests/test_chat.py` 3 个（GET/POST 正常 + 空消息 422）、`tests/test_response_contract.py` 4 个（走工具/不走工具/流式 meta 形状/降级流带键）、`tests/test_memory_owner.py` 6 个（主体推断 + 按主体过滤召回 + 自然表述回归）、`tests/test_memory_forgetting.py` 4 个（时效软删除 / 冲突覆盖 / 召回排除过期，隔离到 tmp DB + 假向量库）、`tests/test_memory_recall.py` 1 个（向量路回填访问统计回归）、`tests/test_personality.py` 3 个（sad 死锁回归 / 怒气惯性 / happy 阈值）。全部 mock 或无外部副作用（不写生产库、不打外部 API、不烧额度）。运行必须带 `HF_HUB_OFFLINE=1`（否则 sentence-transformers 去 HuggingFace 拉模型元数据）。
   - **测试有效性的证据**：对契约用例做过**变异测试**——把三处修复逐条退回，确认对应用例精确变红（`PROJECT_BRIEF.md` §9）；rev4 新增的记忆/人格用例均为"先构造缺陷态、再断言修复"的可回归测试。
-  - **缺口（照实说）**：① **没有 CI**（全仓无 `.github/` / `.gitlab-ci.yml`，测试全靠人手跑）；② **没有真实 LLM 端到端测试**，19 个用例都是 mock 级——它们证明"字段搬运/检索排序/状态机转移正确"，**不证明"真实 LLM 会正确触发工具或抽对事实"**；③ 无覆盖率统计与门槛；④ `extract_facts` / `_analyze_sentiment` 的**解析健壮性**（markdown 包裹、非法 JSON、字段缺失）仍没有一条测试。
+  - **缺口（照实说）**：① **没有 CI**（全仓无 `.github/` / `.gitlab-ci.yml`，测试全靠人手跑）；② **没有真实 LLM 端到端测试**，21 个用例都是 mock 级——它们证明"字段搬运/检索排序/状态机转移正确"，**不证明"真实 LLM 会正确触发工具或抽对事实"**；③ 无覆盖率统计与门槛；④ `extract_facts` / `_analyze_sentiment` 的**解析健壮性**（markdown 包裹、非法 JSON、字段缺失）仍没有一条测试。
   - **可观测性现状**：只有 logging —— 控制台 INFO（`main.py:36-41`）+ `logs/agent.log` DEBUG（`:45-50`），`httpcore/httpx/openai` 噪音被压到 WARNING（`:32-33`，这个细节做得好）。业务关键事件确实有打点：`[RAG] 语义命中/tag命中/注入片段`、`[ReAct] Thoughts/Actions/Tool`、`[UserMemory] 召回 + distance`、`[人格] 情绪/好感度/动量`。**本项目所有"实测证据"都来自 grep 这个日志文件**——说明日志设计是有效的。
   - **最关键的缺口一句话**：**只有分子，没有分母。** 现在能 grep 出"某次格式异常""某次召回了 2 条"，但拿不到"总请求数""命中率""工具调用失败率""格式异常率"——因为没有 metrics、没有计数聚合。补法很轻：把上述日志事件做成计数器（Prometheus counter 或定期聚合写日志），就能在不改架构的前提下拿到所有关键比率。
 
